@@ -6,6 +6,7 @@ yarn.lock
 out/test/**
 
 src/**
+!src/grammars/**
 .gitignore
 .yarnrc
 vsc-extension-quickstart.md

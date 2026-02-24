@@ -1,7 +1,7 @@
 import * as vscode from "vscode";
-import { globSync } from "glob";
-import webpackDep from "webpack-dep";
+import { glob } from "glob";
 import { DepMap } from ".";
+import { DependencyGraph } from "./core/DependencyGraph";
 import { log } from "./extension";
 import { webpackConfigFileName } from "./share";
 
@@ -15,10 +15,15 @@ export class DepService {
     return singletonInstance;
   }
 
-  workspacePathDependencyMapMap = new Map<string, DepMap>();
-  workspacePathDependentMapMap = new Map<string, DepMap>();
+  /** workspace fsPath -> DependencyGraph */
+  private graphs = new Map<string, DependencyGraph>();
+
+  /** FileSystemWatcher subscription */
+  private watcher: vscode.FileSystemWatcher | undefined;
 
   constructor() {}
+
+  // ─── Public API ────────────────────────────────────────────
 
   async getDependencies(uri?: vscode.Uri): Promise<string[]> {
     const fsPath = uri?.fsPath;
@@ -26,13 +31,14 @@ export class DepService {
       return [];
     }
 
-    const dependencyMap = await this.getDependencyMapByWorkspace(
+    const graph = await this.getGraphForWorkspace(
       vscode.workspace.getWorkspaceFolder(uri)
     );
+    if (!graph) {
+      return [];
+    }
 
-    const dependencies = [...(dependencyMap.get(fsPath) || [])];
-
-    return dependencies;
+    return [...graph.getDependencies(fsPath)];
   }
 
   async getDependents(uri?: vscode.Uri): Promise<string[]> {
@@ -41,147 +47,150 @@ export class DepService {
       return [];
     }
 
-    const dependentMap = await this.getDependentMapByWorkspace(
+    const graph = await this.getGraphForWorkspace(
       vscode.workspace.getWorkspaceFolder(uri)
     );
+    if (!graph) {
+      return [];
+    }
 
-    const dependents = [...(dependentMap.get(fsPath) || [])];
-
-    return dependents;
+    return [...graph.getDependents(fsPath)];
   }
 
   async getDependencyMapByWorkspace(
     workspace?: vscode.WorkspaceFolder,
     forceUpdate?: boolean
   ): Promise<DepMap> {
-    const fsPath = workspace?.uri?.fsPath;
-
-    if (!fsPath) {
+    const graph = await this.getGraphForWorkspace(workspace);
+    if (!graph) {
       return new Map();
     }
-
-    const config = vscode.workspace.getConfiguration("dependencyDependent");
-    const excludesConfig = config.get<string[]>("excludes") || [];
-    const entryPoints = DepService.getEntryPoints();
-    let webpackConfigFn: any;
-
-    try {
-      webpackConfigFn = await DepService.getWebpackConfigFn();
-    } catch (error) {
-      log.appendLine(`Error get webpack config: ${error}`);
-    }
-
-    let dependencyMap = this.workspacePathDependencyMapMap.get(fsPath);
-
-    if (!dependencyMap || forceUpdate === true) {
-      const options = {
-        appDirectory: fsPath,
-        excludes: excludesConfig,
-        webpackConfig(config: any) {
-          let _config = config;
-          _config.entry = entryPoints;
-
-          if (typeof webpackConfigFn === "function") {
-            try {
-              const configResult = webpackConfigFn(_config);
-              if (!configResult) {
-                throw Error("function return undefined");
-              }
-              _config = configResult;
-            } catch (error) {
-              log.appendLine(
-                `Error run dependency-dependent-webpack-config.js: ${error}`
-              );
-            }
-          }
-
-          return _config;
-        },
-        errorCb(errors: any[]) {
-          log.appendLine(
-            `Error get dependency map: ${JSON.stringify(errors, null, 2)}`
-          );
-        },
-      };
-
-      log.appendLine(
-        `Start get dependency map: ${JSON.stringify(options, null, 2)}`
-      );
-
-      dependencyMap = new Map();
-
-      const rawDependencyMap = await webpackDep(options);
-
-      for (const [key, rawDependencies] of rawDependencyMap) {
-        const dependencies = new Set<string>();
-        for (const rawDependency of rawDependencies) {
-          dependencies.add(vscode.Uri.file(rawDependency).fsPath);
-        }
-
-        dependencyMap.set(vscode.Uri.file(key).fsPath, dependencies);
-      }
-
-      log.appendLine(
-        `End get dependency map: ${JSON.stringify({
-          dependencyMapSize: dependencyMap.size,
-        })}`
-      );
-
-      this.workspacePathDependencyMapMap.set(fsPath, dependencyMap!);
-    }
-
-    return dependencyMap!;
+    return graph.getDependencyMap();
   }
 
   async getDependentMapByWorkspace(
     workspace?: vscode.WorkspaceFolder,
     forceUpdate?: boolean
   ): Promise<DepMap> {
-    const fsPath = workspace?.uri?.fsPath;
-
-    if (!fsPath) {
+    const graph = await this.getGraphForWorkspace(workspace);
+    if (!graph) {
       return new Map();
     }
-
-    let dependentMap = this.workspacePathDependentMapMap.get(fsPath);
-
-    if (!dependentMap || forceUpdate === true) {
-      const dependencyMap = await this.getDependencyMapByWorkspace(workspace);
-      dependentMap = new Map();
-
-      for (const [dependent, dependencies] of dependencyMap) {
-        for (const dependency of dependencies) {
-          let dependents = dependentMap.get(dependency);
-          if (!dependents) {
-            dependents = new Set();
-            dependentMap.set(dependency, dependents);
-          }
-          dependents.add(dependent);
-        }
-      }
-
-      this.workspacePathDependentMapMap.set(fsPath, dependentMap);
-    }
-
-    return dependentMap;
+    return graph.getDependentMap();
   }
 
+  /**
+   * Force a full re-scan of the active workspace.
+   * Called by the "Refresh" command.
+   */
   async updateActiveWorkspaceDepMap() {
     const uri = vscode.window.activeTextEditor?.document?.uri;
-
     if (!uri) {
       return false;
     }
 
     const workspace = vscode.workspace.getWorkspaceFolder(uri);
+    const fsPath = workspace?.uri?.fsPath;
+    if (!fsPath) {
+      return false;
+    }
 
-    await this.getDependencyMapByWorkspace(workspace, true);
-    await this.getDependentMapByWorkspace(workspace, true);
+    // Delete existing graph to force re-initialization
+    this.graphs.delete(fsPath);
+    await this.getGraphForWorkspace(workspace);
 
     return true;
   }
 
-  static getEntryPoints() {
+  /**
+   * Set up a file system watcher for incremental updates.
+   */
+  setupFileWatcher(context: vscode.ExtensionContext) {
+    if (this.watcher) {
+      return;
+    }
+
+    // Watch for changes to JS/TS/Vue files
+    this.watcher = vscode.workspace.createFileSystemWatcher(
+      "**/*.{js,ts,jsx,tsx,vue}"
+    );
+
+    const handleFileChange = async (uri: vscode.Uri) => {
+      const workspace = vscode.workspace.getWorkspaceFolder(uri);
+      const fsPath = workspace?.uri?.fsPath;
+      if (!fsPath) {
+        return;
+      }
+
+      const graph = this.graphs.get(fsPath);
+      if (!graph || !graph.isInitialized()) {
+        return;
+      }
+
+      log.appendLine(`Incremental update: ${uri.fsPath}`);
+      await graph.processFile(uri.fsPath);
+    };
+
+    const handleFileDelete = (uri: vscode.Uri) => {
+      const workspace = vscode.workspace.getWorkspaceFolder(uri);
+      const fsPath = workspace?.uri?.fsPath;
+      if (!fsPath) {
+        return;
+      }
+
+      const graph = this.graphs.get(fsPath);
+      if (!graph || !graph.isInitialized()) {
+        return;
+      }
+
+      log.appendLine(`File deleted, removing from graph: ${uri.fsPath}`);
+      graph.removeFile(vscode.Uri.file(uri.fsPath).fsPath);
+    };
+
+    this.watcher.onDidChange(handleFileChange);
+    this.watcher.onDidCreate(handleFileChange);
+    this.watcher.onDidDelete(handleFileDelete);
+
+    context.subscriptions.push(this.watcher);
+  }
+
+  // ─── Internal ──────────────────────────────────────────────
+
+  /**
+   * Get or create a DependencyGraph for a workspace.
+   * Initializes the graph on first access.
+   */
+  private async getGraphForWorkspace(
+    workspace?: vscode.WorkspaceFolder
+  ): Promise<DependencyGraph | null> {
+    const fsPath = workspace?.uri?.fsPath;
+    if (!fsPath) {
+      return null;
+    }
+
+    let graph = this.graphs.get(fsPath);
+    if (graph && graph.isInitialized()) {
+      return graph;
+    }
+
+    if (!graph) {
+      graph = new DependencyGraph(fsPath);
+      this.graphs.set(fsPath, graph);
+    }
+
+    const config = vscode.workspace.getConfiguration("dependencyDependent");
+    const entryConfig = config.get<string[]>("entryPoints") || [];
+    const excludesConfig = config.get<string[]>("excludes") || [];
+
+    log.appendLine(`Initializing DependencyGraph for workspace: ${fsPath}`);
+    await graph.initialize(entryConfig, excludesConfig);
+
+    return graph;
+  }
+
+  // ─── Static Helpers (kept for WebpackDefinitionProvider compatibility) ─
+
+  static async getEntryPoints(): Promise<string[]> {
     const uri = vscode.window.activeTextEditor?.document?.uri;
     if (!uri) {
       log.appendLine("No `activeTextEditor.document.uri` found.");
@@ -198,16 +207,15 @@ export class DepService {
     const config = vscode.workspace.getConfiguration("dependencyDependent");
     const entryConfig = config.get<string[]>("entryPoints") || [];
 
-    let result: string[] = [];
-
-    for (const entry of entryConfig) {
-      const found = globSync(entry, {
+    const globPromises = entryConfig.map((entry) =>
+      glob(entry, {
         cwd,
-        absolute: true
-      });
+        absolute: true,
+      })
+    );
 
-      result = [...found, ...result];
-    }
+    const globResults = await Promise.all(globPromises);
+    const result = globResults.flat();
 
     if (!result.length) {
       throw new Error("No entry points found.");

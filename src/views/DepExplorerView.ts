@@ -88,31 +88,52 @@ export default class DepExplorerView
   }
 
   protected getTreeElement = async (element: DepTreeItem) => {
+    if (!element.depUri) {
+      return [];
+    }
+
+    const workspace = vscode.workspace.getWorkspaceFolder(element.depUri);
+
     if (element.depType === DepTypeEnum.Dependency) {
-      const dependencies = await DepService.singleton.getDependencies(
-        element.depUri
+      const dependencyMap = await DepService.singleton.getDependencyMapByWorkspace(
+        workspace
       );
+      const dependencies =
+        dependencyMap.get(element.depUri.fsPath) || new Set<string>();
       const items: DepTreeItem[] = [];
 
       for (const dependency of dependencies) {
         const uri = vscode.Uri.file(dependency);
         const item = new DepTreeItem(uri);
-        const itemDependencies = await DepService.singleton.getDependencies(
-          uri
-        );
+        
+        // Optimally check for children using the map directly
+        const hasChildren = 
+          dependencyMap.has(uri.fsPath) && 
+          dependencyMap.get(uri.fsPath)!.size > 0;
 
         item.depUri = uri;
+        
+        // Smart Label for index files
+        const basename = path.basename(uri.fsPath);
+        if (basename.startsWith("index.")) {
+          const dirname = path.basename(path.dirname(uri.fsPath));
+          item.label = dirname;
+          item.description = `${basename} • ${getRelativePath(element.depUri, item.depUri)}`;
+        } else {
+          item.description = getRelativePath(element.depUri, item.depUri);
+        }
+
         item.command = {
           title: "open",
           command: "vscode.open",
           arguments: [item.depUri],
         };
 
-        if (itemDependencies.length) {
+        if (hasChildren) {
           item.collapsibleState = vscode.TreeItemCollapsibleState.Collapsed;
+          item.iconPath = vscode.ThemeIcon.File;
         }
 
-        item.description = getRelativePath(element.depUri, item.depUri);
         item.depType = DepTypeEnum.Dependency;
 
         items.push(item);
@@ -120,28 +141,45 @@ export default class DepExplorerView
 
       return items;
     } else {
-      const dependents = await DepService.singleton.getDependents(
-        element.depUri
+      const dependentMap = await DepService.singleton.getDependentMapByWorkspace(
+        workspace
       );
+      const dependents =
+        dependentMap.get(element.depUri.fsPath) || new Set<string>();
       const items: DepTreeItem[] = [];
 
       for (const dependent of dependents) {
         const uri = vscode.Uri.file(dependent);
         const item = new DepTreeItem(uri);
-        const itemDependents = await DepService.singleton.getDependents(uri);
+        
+        // Optimally check for children using the map directly
+        const hasChildren = 
+          dependentMap.has(uri.fsPath) && 
+          dependentMap.get(uri.fsPath)!.size > 0;
 
         item.depUri = uri;
-        item.command = {
-          title: "open",
-          command: "vscode.open",
-          arguments: [item.depUri],
-        };
 
-        if (itemDependents.length) {
-          item.collapsibleState = vscode.TreeItemCollapsibleState.Collapsed;
+        // Smart Label for index files
+        const basename = path.basename(uri.fsPath);
+        if (basename.startsWith("index.")) {
+          const dirname = path.basename(path.dirname(uri.fsPath));
+          item.label = dirname;
+          item.description = `${basename} • ${getRelativePath(element.depUri, item.depUri)}`;
+        } else {
+          item.description = getRelativePath(element.depUri, item.depUri);
         }
 
-        item.description = getRelativePath(element.depUri, item.depUri);
+        item.command = {
+          title: "open",
+          command: "dependency-dependent.openAndReveal",
+          arguments: [item.depUri.fsPath, element.depUri.fsPath],
+        };
+
+        if (hasChildren) {
+          item.collapsibleState = vscode.TreeItemCollapsibleState.Collapsed;
+          item.iconPath = vscode.ThemeIcon.File;
+        }
+
         item.depType = DepTypeEnum.Dependent;
 
         items.push(item);
@@ -208,14 +246,18 @@ export default class DepExplorerView
     }
   }
 
-  protected async getSubTreeItems(element) {
-    const dependencyTreeItem = new DepTreeItem("Dependencies");
+  protected async getSubTreeItems(element: DepTreeItem) {
+    const dependencyTreeItem = new DepTreeItem(
+      vscode.l10n.t("Dependencies")
+    );
     dependencyTreeItem.depType = DepTypeEnum.Dependency;
     dependencyTreeItem.collapsibleState =
       vscode.TreeItemCollapsibleState.Expanded;
     dependencyTreeItem.depUri = element.depUri;
 
-    const dependentTreeItem = new DepTreeItem("Dependents");
+    const dependentTreeItem = new DepTreeItem(
+      vscode.l10n.t("Dependents")
+    );
     dependentTreeItem.depType = DepTypeEnum.Dependent;
     dependentTreeItem.collapsibleState =
       vscode.TreeItemCollapsibleState.Expanded;

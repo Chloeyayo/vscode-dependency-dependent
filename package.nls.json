@@ -4,5 +4,7 @@
   "extension.configEntryPoints.title": "Config Entry Points",
   "extension.configWebpack.title": "Config webpack",
   "extension.lock.title": "Lock Tree",
-  "extension.unlock.title": "Unlock Tree"
+  "extension.unlock.title": "Unlock Tree",
+  "extension.treeView.dependencies": "Dependencies",
+  "extension.treeView.dependents": "Dependents"
 }

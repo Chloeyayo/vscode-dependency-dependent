@@ -1,0 +1,13 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(yarn run esbuild)",
+      "Bash(dir \"D:\\\\newWork\\\\vscode-dependency-dependent\\\\src\\\\grammars\\\\*.wasm\")",
+      "Bash(tar:*)",
+      "Bash(where:*)",
+      "Bash(npx tsc:*)",
+      "Bash(yarn install:*)",
+      "Bash(node -e:*)"
+    ]
+  }
+}

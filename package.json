@@ -57,6 +57,17 @@
           ],
           "scope": "window",
           "description": "Exclude finding dependencies in these conditions."
+        },
+        "dependencyDependent.debounceDelay": {
+          "type": "number",
+          "default": 300,
+          "description": "Debounce delay for refreshing the tree view (ms)."
+        },
+        "dependencyDependent.cacheTTL": {
+          "type": "number",
+          "default": 30000,
+          "markdownDeprecationMessage": "No longer used. The dependency graph is now updated incrementally.",
+          "description": "(Deprecated) Cache time-to-live for dependency maps (ms)."
         }
       }
     },
@@ -144,16 +155,29 @@
         "title": "%extension.unlock.title%",
         "icon": "$(lock)",
         "category": "Dependency & Dependent"
+      },
+      {
+        "command": "dependency-dependent.blockSelect",
+        "title": "Block Select",
+        "category": "Dependency & Dependent"
+      }
+    ],
+    "keybindings": [
+      {
+        "command": "dependency-dependent.blockSelect",
+        "key": "ctrl+shift+a",
+        "mac": "cmd+shift+a",
+        "when": "editorTextFocus"
       }
     ]
   },
   "scripts": {
-    "vscode:prepublish": "yarn run esbuild-base --minify",
-    "esbuild-base": "esbuild ./src/extension.ts --bundle --outfile=dist/extension.js --external:vscode --external:webpack-dep --format=cjs --platform=node",
-    "esbuild": "yarn run esbuild-base --sourcemap",
-    "esbuild-watch": "yarn run esbuild-base --sourcemap --watch",
+    "vscode:prepublish": "npm run esbuild-base -- --minify",
+    "esbuild-base": "esbuild ./src/extension.ts --bundle --outfile=dist/extension.js --external:vscode --external:enhanced-resolve --external:web-tree-sitter --format=cjs --platform=node",
+    "esbuild": "npm run esbuild-base -- --sourcemap",
+    "esbuild-watch": "npm run esbuild-base -- --sourcemap --watch",
     "test-compile": "tsc -p ./",
-    "pretest": "yarn run test-compile",
+    "pretest": "npm run test-compile",
     "test": "node ./out/test/runTest.js",
     "deploy": "vsce publish --yarn",
     "_vscode:pack": "vsce package",
@@ -174,7 +198,9 @@
     "typescript": "^5.4.5"
   },
   "dependencies": {
-    "webpack-dep": "^0.4.3"
+    "@types/enhanced-resolve": "^5.0.2",
+    "enhanced-resolve": "^5.19.0",
+    "web-tree-sitter": "0.22.6"
   },
   "icon": "images/icon.png"
 }
