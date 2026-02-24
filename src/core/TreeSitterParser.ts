@@ -247,6 +247,116 @@ export class TreeSitterParser {
         return null;
     }
 
+    /**
+     * Collect all Vue Options API property names from a .vue file.
+     * Returns an array of { name, source } where source is 'data' | 'methods' | 'computed' | 'props'.
+     */
+    public async collectVueOptionProperties(
+        content: string
+    ): Promise<{ name: string; source: 'data' | 'methods' | 'computed' | 'props' }[]> {
+        const scriptInfo = this.extractVueScriptInfo(content);
+        if (!scriptInfo) return [];
+
+        const { scriptContent } = scriptInfo;
+
+        const tsParser = await this.getParser('typescript');
+        if (!tsParser) return [];
+
+        const tsTree = tsParser.parse(scriptContent);
+        if (!tsTree) return [];
+
+        try {
+            return this.collectOptionPropertiesInTree(tsTree);
+        } finally {
+            tsTree.delete();
+        }
+    }
+
+    /**
+     * Traverse the export default object and collect all property names from
+     * data(), methods, computed, and props sections.
+     */
+    private collectOptionPropertiesInTree(
+        tree: any
+    ): { name: string; source: 'data' | 'methods' | 'computed' | 'props' }[] {
+        const root = tree.rootNode;
+        const results: { name: string; source: 'data' | 'methods' | 'computed' | 'props' }[] = [];
+
+        const exportStmt = this.findNodeByType(root, 'export_statement');
+        if (!exportStmt) return results;
+
+        const objectNode = this.findNodeByType(exportStmt, 'object');
+        if (!objectNode) return results;
+
+        for (const child of objectNode.children) {
+            if (child.type === 'pair' || child.type === 'method_definition') {
+                const keyNode = child.childForFieldName('key') || child.childForFieldName('name');
+                if (!keyNode) continue;
+
+                const keyName = keyNode.text;
+
+                // methods / computed / props: collect all keys from the value object
+                if (['methods', 'computed', 'props'].includes(keyName)) {
+                    const source = keyName as 'methods' | 'computed' | 'props';
+                    const valueNode = child.childForFieldName('value');
+
+                    if (valueNode && valueNode.type === 'object') {
+                        this.collectPropertyNames(valueNode, source, results);
+                    }
+
+                    // props can be an array: props: ['foo', 'bar']
+                    if (keyName === 'props' && valueNode && valueNode.type === 'array') {
+                        for (const elem of valueNode.children) {
+                            if (elem.type === 'string' || elem.type === 'string_fragment') {
+                                const text = elem.text.replace(/^['"`]|['"`]$/g, '');
+                                if (text) {
+                                    results.push({ name: text, source: 'props' });
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // data(): collect keys from the return object
+                if (keyName === 'data') {
+                    const bodyNode = child.childForFieldName('body') ||
+                                     child.childForFieldName('value')?.childForFieldName('body');
+                    if (bodyNode) {
+                        const returnStmt = this.findNodeByType(bodyNode, 'return_statement');
+                        if (returnStmt) {
+                            const returnObj = this.findNodeByType(returnStmt, 'object');
+                            if (returnObj) {
+                                this.collectPropertyNames(returnObj, 'data', results);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        return results;
+    }
+
+    /**
+     * Collect all property/method names from an object literal node.
+     */
+    private collectPropertyNames(
+        objectNode: any,
+        source: 'data' | 'methods' | 'computed' | 'props',
+        results: { name: string; source: typeof source }[]
+    ): void {
+        for (const child of objectNode.children) {
+            if (child.type === 'pair' || child.type === 'method_definition') {
+                const keyNode = child.childForFieldName('key') || child.childForFieldName('name');
+                if (keyNode) {
+                    results.push({ name: keyNode.text, source });
+                }
+            } else if (child.type === 'shorthand_property_identifier') {
+                results.push({ name: child.text, source });
+            }
+        }
+    }
+
     // (removed - replaced by extractVueScriptInfo)
 
     private findOptionPropertyInTree(tree: any, targetWord: string): { start: number; end: number } | null {

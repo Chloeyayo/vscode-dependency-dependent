@@ -4,20 +4,22 @@ import { DepService } from "./DepService";
 import configWebpack from "./commands/configWebpack";
 import { getLoading, getLocked, setLoading, setLocked } from "./core/context";
 import { debounce } from "./core/debounce";
+import { reindentText } from "./core/indent";
 import { setContext } from "./share";
 import DepExplorerView from "./views/DepExplorerView";
 import { TreeSitterParser } from "./core/TreeSitterParser";
 
 import { WebpackDefinitionProvider } from "./providers/WebpackDefinitionProvider";
 import { VueOptionsDefinitionProvider } from "./providers/VueOptionsDefinitionProvider";
+import { VueOptionsCompletionProvider } from "./providers/VueOptionsCompletionProvider";
 import { UILibraryDefinitionProvider } from "./providers/UILibraryDefinitionProvider";
 
 export const log = vscode.window.createOutputChannel("Dependency & Dependent");
 
-// Block select: close→open bracket lookup
-const BS_CLOSE_OPEN: Record<string, string> = { '}': '{', ']': '[', ')': '(', '>': '<' };
+// Block select: close→open bracket lookup (< > excluded: they're comparison/generic operators in JS/TS)
+const BS_CLOSE_OPEN: Record<string, string> = { '}': '{', ']': '[', ')': '(' };
 // Block select: open→close bracket lookup
-const BS_OPEN_CLOSE: Record<string, string> = { '{': '}', '[': ']', '(': ')', '<': '>' };
+const BS_OPEN_CLOSE: Record<string, string> = { '{': '}', '[': ']', '(': ')' };
 
 export function activate(context: vscode.ExtensionContext) {
   log.appendLine("Extension activating...");
@@ -60,6 +62,16 @@ export function activate(context: vscode.ExtensionContext) {
     vscode.languages.registerDefinitionProvider(vueSelector, uiLibProvider)
   );
 
+  // Register Completion Provider for Vue Options API (this.xxx)
+  const vueCompletionProvider = new VueOptionsCompletionProvider();
+  context.subscriptions.push(
+    vscode.languages.registerCompletionItemProvider(
+      vueSelector,
+      vueCompletionProvider,
+      '.'  // trigger on dot
+    )
+  );
+
   // Block select command: expand selection to enclosing bracket/quote pair
   context.subscriptions.push(
     vscode.commands.registerCommand("dependency-dependent.blockSelect", () => {
@@ -79,7 +91,11 @@ export function activate(context: vscode.ExtensionContext) {
       let bStart = -1, bOpen = '';
       {
         const stk: string[] = [];
-        for (let i = L; i >= 0; i--) {
+        // Fix: when cursor (no selection) is ON a close bracket, start one position to the
+        // left so the close bracket at L is treated as the right boundary of the block,
+        // not as a nested bracket to skip over.
+        const iStart = (L === R && L > 0 && BS_CLOSE_OPEN[text[L]]) ? L - 1 : L;
+        for (let i = iStart; i >= 0; i--) {
           const c = text[i];
           if (BS_CLOSE_OPEN[c]) {
             stk.push(c);
@@ -109,28 +125,44 @@ export function activate(context: vscode.ExtensionContext) {
         }
       }
 
-      // --- 2. Quote scan (single pass, nearest-first) ---
+      // --- 2. Quote scan (single forward pass, O(n)) ---
+      // Scan 0→L once, toggling open/close state per quote type.
+      // openAt[c]  = opening-quote offset if cursor is inside a c-string, else -1.
+      // lastOpen[c] = offset of the most recent opening quote (needed when cursor
+      //               lands exactly on a closing quote).
       let qStart = -1, qEnd = -1;
-      for (let i = L; i >= 0; i--) {
-        const c = text[i];
-        if ((c === '"' || c === "'" || c === '`') && (i === 0 || text[i - 1] !== '\\')) {
-          // Scan right for matching quote
-          let rp = -1;
-          for (let j = R; j < len; j++) {
-            if (text[j] === c && text[j - 1] !== '\\') { rp = j + 1; break; }
-          }
-          if (rp === -1) continue;
+      {
+        const openAt:  Record<string, number> = { '"': -1, "'": -1, '`': -1 };
+        const lastOpen: Record<string, number> = { '"': -1, "'": -1, '`': -1 };
 
-          // Validate: inner same-quote count must be even
-          let cnt = 0;
-          for (let j = i + 1; j < rp - 1; j++) {
-            if (text[j] === c && (j === 0 || text[j - 1] !== '\\')) cnt++;
-          }
-          if (cnt & 1) continue;
+        for (let i = 0; i <= L; i++) {
+          const c = text[i];
+          if (c !== '"' && c !== "'" && c !== '`') continue;
+          if (i > 0 && text[i - 1] === '\\') continue;
+          if (openAt[c] === -1) { openAt[c] = i; lastOpen[c] = i; }
+          else                  { openAt[c] = -1; }
+        }
 
-          qStart = i;
-          qEnd = rp;
-          break;
+        let bestSpan = Infinity;
+        for (const c of ['"', "'", '`']) {
+          let oPos = -1, cPos = -1;
+
+          if (openAt[c] !== -1) {
+            // Cursor is inside (or on the opening of) a c-string.
+            oPos = openAt[c];
+            // j starts at oPos+1 ≥ 1, so text[j-1] is always in-bounds.
+            for (let j = oPos + 1; j < len; j++) {
+              if (text[j] === c && text[j - 1] !== '\\') { cPos = j; break; }
+            }
+          } else if (lastOpen[c] !== -1 && L < len && text[L] === c && (L === 0 || text[L - 1] !== '\\')) {
+            // Cursor is ON the closing quote of a c-string.
+            oPos = lastOpen[c];
+            cPos = L;
+          }
+
+          if (oPos === -1 || cPos === -1 || cPos < R) continue;
+          const span = cPos + 1 - oPos;
+          if (span < bestSpan) { bestSpan = span; qStart = oPos; qEnd = cPos + 1; }
         }
       }
 
@@ -270,6 +302,84 @@ export function activate(context: vscode.ExtensionContext) {
           }
         } catch (error) {
           vscode.window.showErrorMessage(`Could not open file: ${filePath}`);
+        }
+      }
+    )
+  );
+
+  // --- Paste and Indent ---
+  let pasteSelectAfter = vscode.workspace
+    .getConfiguration("dependencyDependent")
+    .get<boolean>("pasteAndIndent.selectAfter", false);
+
+  context.subscriptions.push(
+    vscode.workspace.onDidChangeConfiguration(e => {
+      if (e.affectsConfiguration("dependencyDependent.pasteAndIndent")) {
+        pasteSelectAfter = vscode.workspace
+          .getConfiguration("dependencyDependent")
+          .get<boolean>("pasteAndIndent.selectAfter", false);
+      }
+    })
+  );
+
+  context.subscriptions.push(
+    vscode.commands.registerCommand(
+      "dependency-dependent.pasteAndIndent",
+      async () => {
+        const editor = vscode.window.activeTextEditor;
+        if (!editor) return;
+
+        const clipboardText = await vscode.env.clipboard.readText();
+        if (!clipboardText) return;
+
+        const lines = clipboardText.split('\n');
+
+        // Single-line paste: just insert directly
+        if (lines.length <= 1) {
+          await editor.edit(editBuilder => {
+            for (const sel of editor.selections) {
+              if (sel.isEmpty) {
+                editBuilder.insert(sel.start, clipboardText);
+              } else {
+                editBuilder.replace(sel, clipboardText);
+              }
+            }
+          });
+          return;
+        }
+
+        const insertSpaces = editor.options.insertSpaces as boolean;
+        const tabSize = editor.options.tabSize as number;
+
+        await editor.edit(editBuilder => {
+          for (const sel of editor.selections) {
+            const start = sel.start;
+            const startLineText = editor.document.getText(
+              new vscode.Range(start.line, 0, start.line, start.character)
+            );
+            const firstNonWhitespace = startLineText.search(/\S/);
+            const offset = firstNonWhitespace > -1 ? firstNonWhitespace : start.character;
+
+            const result = reindentText(clipboardText, offset, { insertSpaces, tabSize });
+
+            if (sel.isEmpty) {
+              editBuilder.insert(start, result);
+            } else {
+              editBuilder.replace(sel, result);
+            }
+          }
+        });
+
+        // Handle selectAfter
+        if (pasteSelectAfter && lines.length > 1) {
+          const newSelections: vscode.Selection[] = [];
+          for (const sel of editor.selections) {
+            const startLine = sel.start.line;
+            const endLine = sel.end.line;
+            const lastLineLength = editor.document.lineAt(endLine).text.length;
+            newSelections.push(new vscode.Selection(startLine + 1, 0, endLine, lastLineLength));
+          }
+          editor.selections = newSelections;
         }
       }
     )

@@ -68,6 +68,11 @@
           "default": 30000,
           "markdownDeprecationMessage": "No longer used. The dependency graph is now updated incrementally.",
           "description": "(Deprecated) Cache time-to-live for dependency maps (ms)."
+        },
+        "dependencyDependent.pasteAndIndent.selectAfter": {
+          "type": "boolean",
+          "default": false,
+          "description": "After pasting and indenting, select the pasted region."
         }
       }
     },
@@ -160,6 +165,11 @@
         "command": "dependency-dependent.blockSelect",
         "title": "Block Select",
         "category": "Dependency & Dependent"
+      },
+      {
+        "command": "dependency-dependent.pasteAndIndent",
+        "title": "%extension.pasteAndIndent.title%",
+        "category": "Dependency & Dependent"
       }
     ],
     "keybindings": [
@@ -168,6 +178,33 @@
         "key": "ctrl+shift+a",
         "mac": "cmd+shift+a",
         "when": "editorTextFocus"
+      },
+      {
+        "command": "dependency-dependent.pasteAndIndent",
+        "key": "ctrl+shift+v",
+        "mac": "cmd+shift+v",
+        "when": "editorTextFocus"
+      }
+    ],
+    "languages": [
+      {
+        "id": "vue",
+        "aliases": ["Vue", "vue"],
+        "extensions": [".vue"],
+        "configuration": "./language-configuration.json"
+      }
+    ],
+    "grammars": [
+      {
+        "language": "vue",
+        "scopeName": "source.vue",
+        "path": "./syntaxes/vue.tmLanguage.json",
+        "embeddedLanguages": {
+          "text.html.basic": "html",
+          "source.js": "javascript",
+          "source.ts": "typescript",
+          "source.css": "css"
+        }
       }
     ]
   },

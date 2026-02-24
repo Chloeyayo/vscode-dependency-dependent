@@ -6,5 +6,6 @@
   "extension.lock.title": "Lock Tree",
   "extension.unlock.title": "Unlock Tree",
   "extension.treeView.dependencies": "Dependencies",
-  "extension.treeView.dependents": "Dependents"
+  "extension.treeView.dependents": "Dependents",
+  "extension.pasteAndIndent.title": "Paste and Indent"
 }

@@ -6,5 +6,6 @@
   "extension.lock.title": "锁定树",
   "extension.unlock.title": "解除锁定树",
   "extension.treeView.dependencies": "依赖 (Dependencies)",
-  "extension.treeView.dependents": "被依赖 (Dependents)"
+  "extension.treeView.dependents": "被依赖 (Dependents)",
+  "extension.pasteAndIndent.title": "粘贴并自动缩进"
 }
