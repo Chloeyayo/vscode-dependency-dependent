@@ -28,6 +28,14 @@ export class TimelineTreeItem extends vscode.TreeItem {
             command: "dependency-dependent.vueTimeline.jumpToLocation",
             arguments: [this]
         };
+
+        if (type === 'lifecycle') {
+            this.tooltip = `Lifecycle Hook: ${label}`;
+        } else if (type === 'watch') {
+            this.tooltip = `Watch Observer: ${label}`;
+        } else if (type === 'action') {
+            this.tooltip = `Action executed here: ${label}`;
+        }
     }
 }
 

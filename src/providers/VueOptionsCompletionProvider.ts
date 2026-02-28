@@ -19,6 +19,14 @@ export class VueOptionsCompletionProvider implements vscode.CompletionItemProvid
     properties: { name: string; source: string }[];
   } | null = null;
 
+  // Cache for nested property completions (keyed by uri + version + chain)
+  private nestedCache: {
+    uri: string;
+    version: number;
+    chainKey: string;
+    names: string[];
+  } | null = null;
+
   constructor(prototypeScanner?: VuePrototypeScanner) {
     this.treeSitterParser = TreeSitterParser.getInstance();
     this.prototypeScanner = prototypeScanner ?? new VuePrototypeScanner();
@@ -40,9 +48,16 @@ export class VueOptionsCompletionProvider implements vscode.CompletionItemProvid
     // Check if we're in a .vue file
     if (!document.fileName.endsWith('.vue')) return null;
 
-    // Match "this." followed by optional partial identifier (e.g. "this.", "this.f", "this.$r")
+    // Match "this." followed by optional partial identifier or nested chain
     const lineText = document.lineAt(position.line).text;
     const textBeforeCursor = lineText.substring(0, position.character);
+
+    // Check for nested property chain: this.obj.inner. or this.obj.
+    const chainMatch = textBeforeCursor.match(/\bthis\.([$\w]+(?:\.[$\w]+)*)\.([$\w]*)$/);
+    if (chainMatch) {
+      return this.provideNestedCompletions(document, position, chainMatch);
+    }
+
     const match = textBeforeCursor.match(/\bthis\.([$\w]*)$/);
     if (!match) return null;
 
@@ -121,6 +136,53 @@ export class VueOptionsCompletionProvider implements vscode.CompletionItemProvid
     if (items.length === 0) return null;
 
     return new vscode.CompletionList(items, false);
+  }
+
+  private async provideNestedCompletions(
+    document: vscode.TextDocument,
+    position: vscode.Position,
+    chainMatch: RegExpMatchArray
+  ): Promise<vscode.CompletionList | null> {
+    const chain = chainMatch[1].split('.');    // e.g. ['obj'] or ['obj', 'inner']
+    const alreadyTyped = chainMatch[2];        // partial text after last dot
+    const dotOffset = position.character - alreadyTyped.length;
+    const replaceRange = new vscode.Range(
+      position.line, dotOffset,
+      position.line, position.character
+    );
+
+    try {
+      const uri = document.uri.toString();
+      const chainKey = chain.join('.');
+      let names: string[];
+
+      if (this.nestedCache && this.nestedCache.uri === uri
+        && this.nestedCache.version === document.version
+        && this.nestedCache.chainKey === chainKey) {
+        names = this.nestedCache.names;
+      } else {
+        names = await this.treeSitterParser.collectNestedProperties(
+          document.getText(), chain
+        );
+        this.nestedCache = { uri, version: document.version, chainKey, names };
+      }
+
+      if (names.length === 0) return null;
+
+      const items = names.map(name => {
+        const item = new vscode.CompletionItem(name, vscode.CompletionItemKind.Field);
+        item.detail = `(${chain.join('.')})`;
+        item.sortText = `0_${name}`;
+        item.filterText = name;
+        item.range = replaceRange;
+        return item;
+      });
+
+      return new vscode.CompletionList(items, false);
+    } catch (e) {
+      console.error("VueOptionsCompletionProvider nested error:", e);
+      return null;
+    }
   }
 
   private getCompletionKind(source: string): vscode.CompletionItemKind {

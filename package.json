@@ -268,11 +268,17 @@
           "source.css": "css"
         }
       }
+    ],
+    "typescriptServerPlugins": [
+      {
+        "name": "./dist/ts-plugin",
+        "languages": ["vue"]
+      }
     ]
   },
   "scripts": {
     "vscode:prepublish": "npm run esbuild-base -- --minify",
-    "esbuild-base": "esbuild ./src/extension.ts --bundle --outfile=dist/extension.js --external:vscode --external:enhanced-resolve --external:web-tree-sitter --format=cjs --platform=node",
+    "esbuild-base": "esbuild ./src/extension.ts --bundle --outfile=dist/extension.js --external:vscode --external:enhanced-resolve --external:web-tree-sitter --format=cjs --platform=node && esbuild ./src/ts-plugin/index.ts --bundle --outfile=dist/ts-plugin.js --format=cjs --platform=node",
     "esbuild": "npm run esbuild-base -- --sourcemap",
     "esbuild-watch": "npm run esbuild-base -- --sourcemap --watch",
     "test-compile": "tsc -p ./",

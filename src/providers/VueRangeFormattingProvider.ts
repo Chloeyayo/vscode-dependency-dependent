@@ -12,6 +12,29 @@ interface SFCRegion {
   contentEnd: number;
 }
 
+/** Custom scheme for virtual formatting documents (invisible to the tab bar). */
+const SCHEME = "vue-format";
+
+/**
+ * In-memory content provider so that `vscode.workspace.openTextDocument(uri)`
+ * can resolve our virtual URIs without creating untitled (visible) tabs.
+ */
+class VueFormatContentProvider implements vscode.TextDocumentContentProvider {
+  private contents = new Map<string, string>();
+
+  set(key: string, content: string): void {
+    this.contents.set(key, content);
+  }
+
+  delete(key: string): void {
+    this.contents.delete(key);
+  }
+
+  provideTextDocumentContent(uri: vscode.Uri): string {
+    return this.contents.get(uri.path) ?? "";
+  }
+}
+
 /**
  * Vue Range Formatting Provider
  * Enables "Format Selection" (Ctrl+K Ctrl+F) in .vue files by:
@@ -21,6 +44,44 @@ interface SFCRegion {
  *   4. Mapping the resulting edits back to the original .vue file
  */
 export class VueRangeFormattingProvider implements vscode.DocumentRangeFormattingEditProvider, vscode.DocumentFormattingEditProvider {
+  private contentProvider = new VueFormatContentProvider();
+  private registration: vscode.Disposable;
+  private seq = 0;
+
+  constructor() {
+    this.registration = vscode.workspace.registerTextDocumentContentProvider(
+      SCHEME,
+      this.contentProvider
+    );
+  }
+
+  dispose(): void {
+    this.registration.dispose();
+  }
+
+  /**
+   * Open a virtual document under the `vue-format` scheme.
+   * The document is invisible (no tab) because it uses a custom scheme.
+   */
+  private async openVirtualDoc(langId: string, content: string): Promise<vscode.TextDocument> {
+    const ext = this.langIdToExt(langId);
+    const key = `/${this.seq++}${ext}`;
+    this.contentProvider.set(key, content);
+    const uri = vscode.Uri.parse(`${SCHEME}:${key}`);
+    try {
+      const doc = await vscode.workspace.openTextDocument(uri);
+      // Force VS Code to recognize the language so formatters activate
+      await vscode.languages.setTextDocumentLanguage(doc, langId);
+      return doc;
+    } catch {
+      this.contentProvider.delete(key);
+      throw new Error(`Failed to open virtual doc for ${langId}`);
+    }
+  }
+
+  private cleanupVirtualDoc(doc: vscode.TextDocument): void {
+    this.contentProvider.delete(doc.uri.path);
+  }
 
   async provideDocumentFormattingEdits(
     document: vscode.TextDocument,
@@ -31,23 +92,25 @@ export class VueRangeFormattingProvider implements vscode.DocumentRangeFormattin
     const regions = this.parseRegions(text);
     const allEdits: vscode.TextEdit[] = [];
 
-    // Format all regions sequentially to accumulate their edits
     for (let i = 0; i < regions.length; i++) {
       if (_token.isCancellationRequested) break;
       const region = regions[i];
       const regionContent = text.substring(region.contentStart, region.contentEnd);
-      const ext = this.langIdToExt(region.langId);
-      
-      try {
-        const virtualDoc = await vscode.workspace.openTextDocument({
-          language: region.langId,
-          content: regionContent,
-        });
 
-        // Use format range provider for the whole virtual document content
+      let virtualDoc: vscode.TextDocument | undefined;
+      try {
+        virtualDoc = await this.openVirtualDoc(region.langId, regionContent);
+
+        // Preserve structural newlines between block tags and content
+        // e.g. the \n after <template> and the \n before </template>
+        const leadingNL = regionContent.match(/^\r?\n/);
+        const trailingNL = regionContent.match(/\r?\n[\t ]*$/);
+        const formatStart = leadingNL ? leadingNL[0].length : 0;
+        const formatEnd = trailingNL ? regionContent.length - trailingNL[0].length : regionContent.length;
+
         const virtualRange = new vscode.Range(
-          virtualDoc.positionAt(0),
-          virtualDoc.positionAt(regionContent.length)
+          virtualDoc.positionAt(formatStart),
+          virtualDoc.positionAt(formatEnd)
         );
 
         const edits = await vscode.commands.executeCommand<vscode.TextEdit[]>(
@@ -59,8 +122,8 @@ export class VueRangeFormattingProvider implements vscode.DocumentRangeFormattin
 
         if (edits && edits.length > 0) {
           const mappedEdits = edits.map(edit => {
-            const origStartOffset = region.contentStart + virtualDoc.offsetAt(edit.range.start);
-            const origEndOffset = region.contentStart + virtualDoc.offsetAt(edit.range.end);
+            const origStartOffset = region.contentStart + virtualDoc!.offsetAt(edit.range.start);
+            const origEndOffset = region.contentStart + virtualDoc!.offsetAt(edit.range.end);
             const origRange = new vscode.Range(
               document.positionAt(origStartOffset),
               document.positionAt(origEndOffset)
@@ -69,8 +132,10 @@ export class VueRangeFormattingProvider implements vscode.DocumentRangeFormattin
           });
           allEdits.push(...mappedEdits);
         }
-      } catch (e) {
+      } catch {
         // Continue to the next region if one fails
+      } finally {
+        if (virtualDoc) this.cleanupVirtualDoc(virtualDoc);
       }
     }
 
@@ -89,42 +154,28 @@ export class VueRangeFormattingProvider implements vscode.DocumentRangeFormattin
     const startOffset = document.offsetAt(range.start);
     const endOffset = document.offsetAt(range.end);
 
-    // Find which region the selection is entirely within
     const region = regions.find(
       r => startOffset >= r.contentStart && endOffset <= r.contentEnd
     );
 
     if (!region) {
-      // Selection crosses region boundaries or is outside any region
       return [];
     }
 
     if (_token.isCancellationRequested) return [];
     const regionContent = text.substring(region.contentStart, region.contentEnd);
 
-    // Calculate the selection range relative to the region content
     const relativeStartOffset = startOffset - region.contentStart;
     const relativeEndOffset = endOffset - region.contentStart;
 
-    // Create a virtual document URI with the appropriate language extension
-    const ext = this.langIdToExt(region.langId);
-    const virtualUri = vscode.Uri.parse(
-      `untitled:${document.uri.fsPath}.format-selection${ext}`
-    );
-
+    let virtualDoc: vscode.TextDocument | undefined;
     try {
-      // Create and show the virtual document (hidden)
-      const virtualDoc = await vscode.workspace.openTextDocument({
-        language: region.langId,
-        content: regionContent,
-      });
+      virtualDoc = await this.openVirtualDoc(region.langId, regionContent);
 
-      // Calculate the range in the virtual document
       const virtualStart = virtualDoc.positionAt(relativeStartOffset);
       const virtualEnd = virtualDoc.positionAt(relativeEndOffset);
       const virtualRange = new vscode.Range(virtualStart, virtualEnd);
 
-      // Execute the built-in format range command on the virtual document
       const edits = await vscode.commands.executeCommand<vscode.TextEdit[]>(
         'vscode.executeFormatRangeProvider',
         virtualDoc.uri,
@@ -134,10 +185,9 @@ export class VueRangeFormattingProvider implements vscode.DocumentRangeFormattin
 
       if (!edits || edits.length === 0) return [];
 
-      // Map edits from virtual document positions back to the original .vue file
       const mappedEdits: vscode.TextEdit[] = edits.map(edit => {
-        const origStartOffset = region.contentStart + virtualDoc.offsetAt(edit.range.start);
-        const origEndOffset = region.contentStart + virtualDoc.offsetAt(edit.range.end);
+        const origStartOffset = region.contentStart + virtualDoc!.offsetAt(edit.range.start);
+        const origEndOffset = region.contentStart + virtualDoc!.offsetAt(edit.range.end);
         const origRange = new vscode.Range(
           document.positionAt(origStartOffset),
           document.positionAt(origEndOffset)
@@ -146,9 +196,10 @@ export class VueRangeFormattingProvider implements vscode.DocumentRangeFormattin
       });
 
       return mappedEdits;
-    } catch (e) {
-      // If formatting fails, return no edits silently
+    } catch {
       return [];
+    } finally {
+      if (virtualDoc) this.cleanupVirtualDoc(virtualDoc);
     }
   }
 
@@ -158,8 +209,6 @@ export class VueRangeFormattingProvider implements vscode.DocumentRangeFormattin
   private parseRegions(text: string): SFCRegion[] {
     const regions: SFCRegion[] = [];
 
-    // Match <template>, <script>, <style> blocks
-    // Pattern: <tag [attrs]> ... </tag>
     const blockPattern = /<(template|script|style)(\b[^>]*)>/gi;
     let match: RegExpExecArray | null;
 
@@ -168,14 +217,12 @@ export class VueRangeFormattingProvider implements vscode.DocumentRangeFormattin
       const attrs = match[2] || '';
       const contentStart = match.index + match[0].length;
 
-      // Find the closing tag
       const closingTag = new RegExp(`</${tagName}\\s*>`, 'i');
       const closeMatch = closingTag.exec(text.substring(contentStart));
       if (!closeMatch) continue;
 
       const contentEnd = contentStart + closeMatch.index;
 
-      // Determine the language from the tag + lang attribute
       const langId = this.detectLangId(tagName, attrs);
 
       regions.push({ langId, contentStart, contentEnd });

@@ -260,12 +260,18 @@ export class TreeSitterParser {
         const query = this.getImportQuery(langId);
         if (!query) return [];
 
-        const matches = query.matches(tree.rootNode);
+        let matches: any[];
+        try {
+            matches = query.matches(tree.rootNode);
+        } catch {
+            // web-tree-sitter marshalNode may crash on certain ASTs with null nodes
+            return [];
+        }
         const imports: string[] = [];
 
         for (const match of matches) {
             for (const capture of match.captures) {
-                if (capture.name === 'source') {
+                if (capture.name === 'source' && capture.node) {
                     const text = capture.node.text;
                     if (text.length >= 2) {
                         imports.push(text.substring(1, text.length - 1));
@@ -405,6 +411,98 @@ export class TreeSitterParser {
                 results.push({ name: child.text, source });
             }
         }
+    }
+
+    /**
+     * Given a property chain like ['obj', 'inner'], resolve the nested object
+     * in data/computed/props and return its property names.
+     */
+    public async collectNestedProperties(
+        content: string,
+        chain: string[]
+    ): Promise<string[]> {
+        if (chain.length === 0) return [];
+
+        const scriptInfo = this.extractVueScriptInfo(content);
+        if (!scriptInfo) return [];
+
+        const tsTree = await this.parseWithCache('typescript', scriptInfo.scriptContent);
+        if (!tsTree) return [];
+
+        const root = tsTree.rootNode;
+        const exportStmt = this.findNodeByType(root, 'export_statement');
+        if (!exportStmt) return [];
+
+        const objectNode = this.findNodeByType(exportStmt, 'object');
+        if (!objectNode) return [];
+
+        // Search through data, computed, props, methods for the first property in chain
+        let targetNode: any = null;
+
+        for (const child of objectNode.children) {
+            if (child.type !== 'pair' && child.type !== 'method_definition') continue;
+            const keyNode = child.childForFieldName('key') || child.childForFieldName('name');
+            if (!keyNode) continue;
+            const keyName = keyNode.text;
+
+            if (keyName === 'data') {
+                const bodyNode = child.childForFieldName('body') ||
+                    child.childForFieldName('value')?.childForFieldName('body');
+                if (bodyNode) {
+                    const returnStmt = this.findNodeByType(bodyNode, 'return_statement');
+                    if (returnStmt) {
+                        const returnObj = this.findNodeByType(returnStmt, 'object');
+                        if (returnObj) {
+                            targetNode = this.findNestedObject(returnObj, chain);
+                            if (targetNode) break;
+                        }
+                    }
+                }
+            } else if (['computed', 'props', 'methods'].includes(keyName)) {
+                const valueNode = child.childForFieldName('value');
+                if (valueNode && valueNode.type === 'object') {
+                    targetNode = this.findNestedObject(valueNode, chain);
+                    if (targetNode) break;
+                }
+            }
+        }
+
+        if (!targetNode || targetNode.type !== 'object') return [];
+
+        const names: string[] = [];
+        for (const c of targetNode.children) {
+            if (c.type === 'pair' || c.type === 'method_definition') {
+                const k = c.childForFieldName('key') || c.childForFieldName('name');
+                if (k) names.push(k.text);
+            } else if (c.type === 'shorthand_property_identifier') {
+                names.push(c.text);
+            }
+        }
+        return names;
+    }
+
+    /**
+     * Walk a chain of property names through nested object literals.
+     * Returns the value node of the last property in the chain.
+     */
+    private findNestedObject(objectNode: any, chain: string[]): any {
+        let current = objectNode;
+        for (const propName of chain) {
+            if (!current || current.type !== 'object') return null;
+            let found = false;
+            for (const child of current.children) {
+                if (child.type === 'pair') {
+                    const keyNode = child.childForFieldName('key');
+                    if (keyNode && keyNode.text === propName) {
+                        current = child.childForFieldName('value');
+                        found = true;
+                        break;
+                    }
+                }
+            }
+            if (!found) return null;
+        }
+        return current;
     }
 
     // (removed - replaced by extractVueScriptInfo)
@@ -548,13 +646,19 @@ export class TreeSitterParser {
         const query = this.getIdentifierImportQuery(langId);
         if (!query) return null;
 
-        const matches = query.matches(tree.rootNode);
+        let matches: any[];
+        try {
+            matches = query.matches(tree.rootNode);
+        } catch {
+            return null;
+        }
 
         for (const match of matches) {
             let foundIdentifier = false;
             let sourcePath: string | null = null;
 
             for (const capture of match.captures) {
+                if (!capture.node) continue;
                 if ((capture.name === 'default_import' || capture.name === 'named_import') &&
                     capture.node.text === identifier) {
                     foundIdentifier = true;
@@ -630,7 +734,8 @@ export class TreeSitterParser {
         const LIFECYCLES = new Set([
             'beforeCreate', 'created', 'beforeMount', 'mounted', 
             'beforeUpdate', 'updated', 'activated', 'deactivated', 
-            'beforeDestroy', 'destroyed', 'errorCaptured'
+            'beforeDestroy', 'destroyed', 'errorCaptured',
+            'serverPrefetch', 'renderTracked', 'renderTriggered'
         ]);
 
         for (const child of objectNode.children) {
@@ -741,7 +846,7 @@ export class TreeSitterParser {
                 const funcNode = node.childForFieldName('function');
                 if (funcNode && funcNode.type === 'member_expression') {
                     const objectNode = funcNode.childForFieldName('object');
-                    if (objectNode && objectNode.text === 'this' || (objectNode.type === 'member_expression' && objectNode.text.startsWith('this.'))) {
+                    if (objectNode && (objectNode.text === 'this' || (objectNode.type === 'member_expression' && objectNode.text.startsWith('this.')))) {
                         actions.push({
                             type: 'call',
                             label: `${funcNode.text}()`,
@@ -752,15 +857,20 @@ export class TreeSitterParser {
                 }
             }
             
-            // Assignments: this.someProp = ...
+            // Assignments: this.someProp = 123 or this.obj.prop = 123
             if (node.type === 'assignment_expression') {
                 const leftNode = node.childForFieldName('left');
+                const rightNode = node.childForFieldName('right');
                 if (leftNode && leftNode.type === 'member_expression') {
                     const objectNode = leftNode.childForFieldName('object');
-                    if (objectNode && objectNode.text === 'this') {
+                    if (objectNode && (objectNode.text === 'this' || (objectNode.type === 'member_expression' && objectNode.text.startsWith('this.')))) {
+                        let rightText = rightNode ? rightNode.text.replace(/\s+/g, ' ') : '';
+                        if (rightText.length > 30) {
+                            rightText = rightText.substring(0, 30) + '...';
+                        }
                         actions.push({
                             type: 'assignment',
-                            label: `${leftNode.text} =`,
+                            label: `${leftNode.text} = ${rightText}`,
                             start: node.startIndex,
                             end: node.endIndex
                         });
@@ -768,18 +878,50 @@ export class TreeSitterParser {
                 }
             }
 
-            for (const child of node.children) {
-                processNode(child);
+            // Always recurse defensively
+            if (node.children && Array.isArray(node.children)) {
+                for (const child of node.children) {
+                    processNode(child);
+                }
             }
         };
 
-        for (const stmt of blockNode.children) {
-             processNode(stmt);
+        if (blockNode.children && Array.isArray(blockNode.children)) {
+            for (const stmt of blockNode.children) {
+                 processNode(stmt);
+            }
         }
 
         // Sort actions chronologically
         actions.sort((a, b) => a.start - b.start);
 
-        return actions;
+        // Deduplicate assignments / calls that appear on the same AST level/branch to avoid clutter
+        // Specifically, if an action modifies the same property as another action, we keep the first one
+        // and optionally change it to show it happens conditionally.
+        const filteredActions: any[] = [];
+        const seenProperties = new Set<string>();
+
+        for (const action of actions) {
+            // For assignments, we can extract the left side before '=' 
+            // example: "this.a = 2" -> left side: "this.a"
+            const match = action.type === 'assignment' ? action.label.split(' =')[0] : action.label;
+            
+            if (!seenProperties.has(match)) {
+                seenProperties.add(match);
+                filteredActions.push(action);
+            } else {
+                // We've seen this before, let's update the existing one to indicate multiple branches
+                const existing = filteredActions.find(a => (a.type === 'assignment' ? a.label.split(' =')[0] : a.label) === match);
+                if (existing && !existing.label.includes(' (conditional)')) {
+                    if (existing.type === 'assignment') {
+                        existing.label = `${match} = ... (conditional)`;
+                    } else {
+                        existing.label = `${match} (conditional)`;
+                    }
+                }
+            }
+        }
+
+        return filteredActions;
     }
 }

@@ -123,6 +123,7 @@ export function activate(context: vscode.ExtensionContext) {
   // Register Formatting Providers for Vue files (Format Selection and Format Document)
   const vueRangeFormattingProvider = new VueRangeFormattingProvider();
   context.subscriptions.push(
+    vueRangeFormattingProvider, // dispose() cleans up the internal content provider
     vscode.languages.registerDocumentRangeFormattingEditProvider(
       vueSelector,
       vueRangeFormattingProvider

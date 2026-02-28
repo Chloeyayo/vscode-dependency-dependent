@@ -32,6 +32,9 @@ const LIFECYCLE_ORDER: Record<string, number> = {
     'beforeDestroy': 90,
     'destroyed': 100,
     'errorCaptured': 110,
+    'serverPrefetch': 120,
+    'renderTracked': 130,
+    'renderTriggered': 140,
 };
 
 export class VueTimelineAnalyzer {
