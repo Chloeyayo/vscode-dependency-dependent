@@ -108,7 +108,19 @@
       }
     ],
     "menus": {
+      "editor/context": [
+        {
+          "command": "dependency-dependent.vueTimeline.trackVariable",
+          "when": "editorLangId == vue",
+          "group": "navigation@100"
+        }
+      ],
       "view/title": [
+        {
+          "command": "dependency-dependent.vueTimeline.exitTrackingMode",
+          "when": "dependency-dependent.trackingMode && view == dependency-dependent-VueTimelineView",
+          "group": "navigation@10"
+        },
         {
           "command": "dependency-dependent.refresh",
           "when": "!dependency-dependent.loading && view == dependency-dependent-DepExplorerView",
@@ -135,6 +147,14 @@
       ],
       "commandPalette": [
         {
+          "command": "dependency-dependent.vueTimeline.trackVariable",
+          "when": "editorLangId == vue"
+        },
+        {
+          "command": "dependency-dependent.vueTimeline.exitTrackingMode",
+          "when": "dependency-dependent.trackingMode"
+        },
+        {
           "command": "dependency-dependent.refresh",
           "when": "!dependency-dependent.loading"
         },
@@ -158,6 +178,17 @@
       {
         "command": "dependency-dependent.vueTimeline.jumpToLocation",
         "title": "Jump to Timeline Location",
+        "category": "Dependency & Dependent"
+      },
+      {
+        "command": "dependency-dependent.vueTimeline.trackVariable",
+        "title": "Track Variable Lifecycle",
+        "category": "Dependency & Dependent"
+      },
+      {
+        "command": "dependency-dependent.vueTimeline.exitTrackingMode",
+        "title": "Exit Variable Tracking",
+        "icon": "$(close)",
         "category": "Dependency & Dependent"
       },
       {

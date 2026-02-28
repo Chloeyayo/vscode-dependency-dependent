@@ -1,5 +1,6 @@
 import * as vscode from 'vscode';
 import { TreeSitterParser } from './TreeSitterParser';
+import { VueVariableTracker, VariableTrackingResult } from './VueVariableTracker';
 
 export interface TimelineEvent {
     type: 'lifecycle' | 'watch';
@@ -35,9 +36,18 @@ const LIFECYCLE_ORDER: Record<string, number> = {
 
 export class VueTimelineAnalyzer {
     private treeSitterParser: TreeSitterParser;
+    private variableTracker: VueVariableTracker;
 
     constructor() {
         this.treeSitterParser = TreeSitterParser.getInstance();
+        this.variableTracker = new VueVariableTracker();
+    }
+
+    /**
+     * Track a variable through the component lifecycle call chains.
+     */
+    public async trackVariable(content: string, variableName: string, uri: vscode.Uri): Promise<VariableTrackingResult> {
+        return this.variableTracker.trackVariable(content, variableName, uri);
     }
 
     /**
