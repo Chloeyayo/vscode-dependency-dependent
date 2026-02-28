@@ -610,6 +610,293 @@ export class TreeSitterParser {
     }
 
     /**
+     * Extract all `this.xxx()` call sites from a function body node.
+     * Filters out `this.$xxx()` (Vue built-in / plugin calls).
+     */
+    private extractCallSitesFromBody(bodyNode: any): { methodName: string; start: number; end: number }[] {
+        if (!bodyNode) return [];
+        const sites: { methodName: string; start: number; end: number }[] = [];
+
+        const walk = (node: any) => {
+            if (!node) return;
+            if (node.type === 'call_expression') {
+                const funcNode = node.childForFieldName('function');
+                if (funcNode && funcNode.type === 'member_expression') {
+                    const obj = funcNode.childForFieldName('object');
+                    const prop = funcNode.childForFieldName('property');
+                    if (obj && obj.text === 'this' && prop) {
+                        const name = prop.text;
+                        // Skip $-prefixed (Vue built-ins like this.$emit, this.$set)
+                        if (!name.startsWith('$')) {
+                            sites.push({ methodName: name, start: node.startIndex, end: node.endIndex });
+                        }
+                    }
+                }
+            }
+            for (const child of node.children) {
+                walk(child);
+            }
+        };
+        walk(bodyNode);
+        sites.sort((a, b) => a.start - b.start);
+        return sites;
+    }
+
+    /**
+     * Extract all `this.xxx = ...` variable assignments from a function body node.
+     */
+    private extractVariableAssignmentsFromBody(bodyNode: any): { variableName: string; fullExpression: string; start: number; end: number }[] {
+        if (!bodyNode) return [];
+        const assignments: { variableName: string; fullExpression: string; start: number; end: number }[] = [];
+
+        const walk = (node: any) => {
+            if (!node) return;
+            if (node.type === 'assignment_expression') {
+                const leftNode = node.childForFieldName('left');
+                if (leftNode && leftNode.type === 'member_expression') {
+                    const obj = leftNode.childForFieldName('object');
+                    const prop = leftNode.childForFieldName('property');
+                    if (obj && obj.text === 'this' && prop) {
+                        assignments.push({
+                            variableName: prop.text,
+                            fullExpression: node.text,
+                            start: node.startIndex,
+                            end: node.endIndex
+                        });
+                    }
+                }
+            }
+            for (const child of node.children) {
+                walk(child);
+            }
+        };
+        walk(bodyNode);
+        assignments.sort((a, b) => a.start - b.start);
+        return assignments;
+    }
+
+    /**
+     * Extract initial values from a `data()` return object.
+     */
+    private extractDataInitValuesFromReturn(returnObjNode: any): Map<string, { variableName: string; valueText: string; start: number; end: number }> {
+        const result = new Map<string, { variableName: string; valueText: string; start: number; end: number }>();
+        if (!returnObjNode) return result;
+
+        for (const child of returnObjNode.children) {
+            if (child.type === 'pair') {
+                const keyNode = child.childForFieldName('key');
+                const valueNode = child.childForFieldName('value');
+                if (keyNode && valueNode) {
+                    result.set(keyNode.text, {
+                        variableName: keyNode.text,
+                        valueText: valueNode.text,
+                        start: child.startIndex,
+                        end: child.endIndex
+                    });
+                }
+            } else if (child.type === 'shorthand_property_identifier') {
+                result.set(child.text, {
+                    variableName: child.text,
+                    valueText: child.text,
+                    start: child.startIndex,
+                    end: child.endIndex
+                });
+            }
+        }
+        return result;
+    }
+
+    /**
+     * Build a component-internal call graph from the `export default {}` object.
+     * Returns method descriptors for lifecycle hooks, watchers, and user methods,
+     * plus data() initial values.
+     */
+    public async buildComponentCallGraph(scriptContent: string): Promise<{
+        methods: Map<string, {
+            name: string;
+            isLifecycle: boolean;
+            isWatcher: boolean;
+            watchTarget?: string;
+            watchImmediate?: boolean;
+            calls: { methodName: string; start: number; end: number }[];
+            assignments: { variableName: string; fullExpression: string; start: number; end: number }[];
+            start: number;
+            end: number;
+        }>;
+        dataInitialValues: Map<string, { variableName: string; valueText: string; start: number; end: number }>;
+    }> {
+        const methods = new Map<string, {
+            name: string;
+            isLifecycle: boolean;
+            isWatcher: boolean;
+            watchTarget?: string;
+            watchImmediate?: boolean;
+            calls: { methodName: string; start: number; end: number }[];
+            assignments: { variableName: string; fullExpression: string; start: number; end: number }[];
+            start: number;
+            end: number;
+        }>();
+        const dataInitialValues = new Map<string, { variableName: string; valueText: string; start: number; end: number }>();
+
+        const tree = await this.parseWithCache('typescript', scriptContent);
+        if (!tree) return { methods, dataInitialValues };
+
+        const root = tree.rootNode;
+        const exportStmt = this.findNodeByType(root, 'export_statement');
+        if (!exportStmt) return { methods, dataInitialValues };
+
+        const objectNode = this.findNodeByType(exportStmt, 'object');
+        if (!objectNode) return { methods, dataInitialValues };
+
+        const LIFECYCLES = new Set([
+            'beforeCreate', 'created', 'beforeMount', 'mounted',
+            'beforeUpdate', 'updated', 'activated', 'deactivated',
+            'beforeDestroy', 'destroyed', 'errorCaptured'
+        ]);
+
+        const processMethodBody = (name: string, bodyNode: any, startIndex: number, endIndex: number, opts: { isLifecycle: boolean; isWatcher: boolean; watchTarget?: string; watchImmediate?: boolean }) => {
+            const calls = this.extractCallSitesFromBody(bodyNode);
+            const assignments = this.extractVariableAssignmentsFromBody(bodyNode);
+            methods.set(name, {
+                name,
+                isLifecycle: opts.isLifecycle,
+                isWatcher: opts.isWatcher,
+                watchTarget: opts.watchTarget,
+                watchImmediate: opts.watchImmediate,
+                calls,
+                assignments,
+                start: startIndex,
+                end: endIndex
+            });
+        };
+
+        for (const child of objectNode.children) {
+            const keyNode = child.childForFieldName('key') || child.childForFieldName('name');
+            if (!keyNode) continue;
+            const keyName = keyNode.text;
+
+            // --- data() ---
+            if (keyName === 'data') {
+                const bodyNode = child.childForFieldName('body') ||
+                    child.childForFieldName('value')?.childForFieldName('body');
+                if (bodyNode) {
+                    const returnStmt = this.findNodeByType(bodyNode, 'return_statement');
+                    if (returnStmt) {
+                        const returnObj = this.findNodeByType(returnStmt, 'object');
+                        if (returnObj) {
+                            const initVals = this.extractDataInitValuesFromReturn(returnObj);
+                            for (const [k, v] of initVals) {
+                                dataInitialValues.set(k, v);
+                            }
+                        }
+                    }
+                }
+                continue;
+            }
+
+            // --- Lifecycle hooks ---
+            if (LIFECYCLES.has(keyName)) {
+                let bodyNode = null;
+                if (child.type === 'method_definition') {
+                    bodyNode = child.childForFieldName('body');
+                } else if (child.type === 'pair') {
+                    const val = child.childForFieldName('value');
+                    if (val && (val.type === 'function_expression' || val.type === 'arrow_function')) {
+                        bodyNode = val.childForFieldName('body');
+                    }
+                }
+                if (bodyNode) {
+                    processMethodBody(keyName, bodyNode, child.startIndex, child.endIndex, { isLifecycle: true, isWatcher: false });
+                }
+                continue;
+            }
+
+            // --- methods: { ... } ---
+            if (keyName === 'methods') {
+                const valNode = child.childForFieldName('value');
+                if (valNode && valNode.type === 'object') {
+                    for (const mChild of valNode.children) {
+                        const mKeyNode = mChild.childForFieldName('key') || mChild.childForFieldName('name');
+                        if (!mKeyNode) continue;
+                        let mBodyNode = null;
+                        if (mChild.type === 'method_definition') {
+                            mBodyNode = mChild.childForFieldName('body');
+                        } else if (mChild.type === 'pair') {
+                            const mVal = mChild.childForFieldName('value');
+                            if (mVal && (mVal.type === 'function_expression' || mVal.type === 'arrow_function')) {
+                                mBodyNode = mVal.childForFieldName('body');
+                            }
+                        }
+                        if (mBodyNode) {
+                            processMethodBody(mKeyNode.text, mBodyNode, mChild.startIndex, mChild.endIndex, { isLifecycle: false, isWatcher: false });
+                        }
+                    }
+                }
+                continue;
+            }
+
+            // --- watch: { ... } ---
+            if (keyName === 'watch') {
+                const watchObj = child.childForFieldName('value');
+                if (watchObj && watchObj.type === 'object') {
+                    for (const wChild of watchObj.children) {
+                        const wKeyNode = wChild.childForFieldName('key') || wChild.childForFieldName('name');
+                        if (!wKeyNode) continue;
+                        const wKeyName = wKeyNode.text.replace(/^['"`]|['"`]$/g, '');
+
+                        let wBodyNode = null;
+                        let isImmediate = false;
+
+                        if (wChild.type === 'method_definition') {
+                            wBodyNode = wChild.childForFieldName('body');
+                        } else if (wChild.type === 'pair') {
+                            const wVal = wChild.childForFieldName('value');
+                            if (wVal && (wVal.type === 'function_expression' || wVal.type === 'arrow_function')) {
+                                wBodyNode = wVal.childForFieldName('body');
+                            } else if (wVal && wVal.type === 'object') {
+                                // Object syntax: watch: { foo: { handler() {}, immediate: true } }
+                                for (const opt of wVal.children) {
+                                    const optKey = opt.childForFieldName('key') || opt.childForFieldName('name');
+                                    if (optKey && optKey.text === 'handler') {
+                                        if (opt.type === 'method_definition') {
+                                            wBodyNode = opt.childForFieldName('body');
+                                        } else if (opt.type === 'pair') {
+                                            const hVal = opt.childForFieldName('value');
+                                            if (hVal && (hVal.type === 'function_expression' || hVal.type === 'arrow_function')) {
+                                                wBodyNode = hVal.childForFieldName('body');
+                                            }
+                                        }
+                                    } else if (optKey && optKey.text === 'immediate') {
+                                        if (opt.type === 'pair') {
+                                            const immVal = opt.childForFieldName('value');
+                                            if (immVal && immVal.text === 'true') {
+                                                isImmediate = true;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
+                        if (wBodyNode) {
+                            const watchMethodName = `watch:${wKeyName}`;
+                            processMethodBody(watchMethodName, wBodyNode, wChild.startIndex, wChild.endIndex, {
+                                isLifecycle: false,
+                                isWatcher: true,
+                                watchTarget: wKeyName,
+                                watchImmediate: isImmediate
+                            });
+                        }
+                    }
+                }
+                continue;
+            }
+        }
+
+        return { methods, dataInitialValues };
+    }
+
+    /**
      * Extracts timeline events from a parsed AST tree for the Vue Timeline Outline feature.
      * This looks for lifecycle methods and watch definitions in the `export default` object.
      */

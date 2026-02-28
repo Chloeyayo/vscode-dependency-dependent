@@ -41,9 +41,11 @@ export function activate(context: vscode.ExtensionContext) {
 
   new DepExplorerView(context);
   const vueTimelineProvider = new VueTimelineProvider();
-  context.subscriptions.push(
-      vscode.window.registerTreeDataProvider('dependency-dependent-VueTimelineView', vueTimelineProvider)
-  );
+  const vueTimelineView = vscode.window.createTreeView('dependency-dependent-VueTimelineView', {
+      treeDataProvider: vueTimelineProvider
+  });
+  vueTimelineProvider.treeView = vueTimelineView;
+  context.subscriptions.push(vueTimelineView);
   
   // Set up file system watcher for incremental dependency graph updates
   DepService.singleton.setupFileWatcher(context);
@@ -373,6 +375,63 @@ export function activate(context: vscode.ExtensionContext) {
               if (item) {
                   vueTimelineProvider.jumpToLocation(item);
               }
+          }
+      )
+  );
+
+  // Track Variable Lifecycle: right-click on this.xxx in a .vue file
+  context.subscriptions.push(
+      vscode.commands.registerCommand(
+          "dependency-dependent.vueTimeline.trackVariable",
+          async () => {
+              const editor = vscode.window.activeTextEditor;
+              if (!editor || editor.document.languageId !== 'vue') return;
+
+              const document = editor.document;
+              const position = editor.selection.active;
+              const wordRange = document.getWordRangeAtPosition(position, /[$\w]+/);
+              if (!wordRange) return;
+
+              let variableName = document.getText(wordRange);
+
+              // Check if preceded by "this." — allow clicking on either "this" or the property
+              const lineText = document.lineAt(position.line).text;
+              const wordStart = wordRange.start.character;
+
+              if (variableName === 'this') {
+                  // User clicked on "this" — grab the property after the dot
+                  const afterThis = lineText.substring(wordStart + 4); // skip "this"
+                  const propMatch = afterThis.match(/^\.(\w+)/);
+                  if (propMatch) {
+                      variableName = propMatch[1];
+                  } else {
+                      return;
+                  }
+              } else if (wordStart >= 5 && lineText.substring(wordStart - 5, wordStart) === 'this.') {
+                  // Already have the property name, preceded by "this."
+              } else {
+                  // Not a this.xxx pattern — still allow tracking by property name
+              }
+
+              // Skip $-prefixed properties
+              if (variableName.startsWith('$')) return;
+
+              await vueTimelineProvider.enterTrackingMode(variableName, document);
+              // Reveal the timeline view
+              vueTimelineView.reveal(undefined as any, { focus: true }).catch(() => {
+                  // View may not support reveal without an element, just focus
+                  vscode.commands.executeCommand('dependency-dependent-VueTimelineView.focus');
+              });
+          }
+      )
+  );
+
+  // Exit tracking mode
+  context.subscriptions.push(
+      vscode.commands.registerCommand(
+          "dependency-dependent.vueTimeline.exitTrackingMode",
+          () => {
+              vueTimelineProvider.exitTrackingMode();
           }
       )
   );
