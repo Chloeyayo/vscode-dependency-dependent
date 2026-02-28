@@ -11,6 +11,8 @@ import DepExplorerView from "./views/DepExplorerView";
 import { TreeSitterParser } from "./core/TreeSitterParser";
 import { VueTemplateCompletionProvider } from "./providers/VueTemplateCompletionProvider";
 import { VueRangeFormattingProvider } from "./providers/VueRangeFormattingProvider";
+import { VueComponentPropsCompletionProvider } from "./providers/VueComponentPropsCompletionProvider";
+import { VueComponentTagCompletionProvider } from "./providers/VueComponentTagCompletionProvider";
 
 import { WebpackDefinitionProvider } from "./providers/WebpackDefinitionProvider";
 import { VueOptionsDefinitionProvider } from "./providers/VueOptionsDefinitionProvider";
@@ -102,6 +104,18 @@ export function activate(context: vscode.ExtensionContext) {
       vueTemplateCompletionProvider,
       '{', '"', "'"  // trigger on {{ and attribute value quotes
     )
+  );
+
+  // Sub-component Props completion (space trigger inside open tags)
+  const vuePropsProvider = new VueComponentPropsCompletionProvider();
+  context.subscriptions.push(
+    vscode.languages.registerCompletionItemProvider(vueSelector, vuePropsProvider, ' ')
+  );
+
+  // Auto-import component (< trigger in template)
+  const vueTagProvider = new VueComponentTagCompletionProvider();
+  context.subscriptions.push(
+    vscode.languages.registerCompletionItemProvider(vueSelector, vueTagProvider, '<')
   );
 
   // Register Formatting Providers for Vue files (Format Selection and Format Document)

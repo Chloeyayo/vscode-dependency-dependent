@@ -610,6 +610,68 @@ export class TreeSitterParser {
     }
 
     /**
+     * Find the end offset (in scriptContent) of the last import statement.
+     * Returns 0 if there are no imports.
+     */
+    public async findLastImportEndOffset(scriptContent: string): Promise<number> {
+        const tree = await this.parseWithCache('typescript', scriptContent);
+        if (!tree) return 0;
+        const query = this.getImportQuery('typescript');
+        if (!query) {
+            // Fallback: walk root children directly
+            let lastEnd = 0;
+            for (const child of tree.rootNode.children) {
+                if (child.type === 'import_statement' && child.endIndex > lastEnd) {
+                    lastEnd = child.endIndex;
+                }
+            }
+            return lastEnd;
+        }
+        let lastEnd = 0;
+        for (const child of tree.rootNode.children) {
+            if (child.type === 'import_statement' && child.endIndex > lastEnd) {
+                lastEnd = child.endIndex;
+            }
+        }
+        return lastEnd;
+    }
+
+    /**
+     * Find information about where to insert a component registration.
+     * Returns either an 'existing' location (inside existing components: {}) or
+     * a 'new' location (after export default {) to create components: {}.
+     */
+    public async findComponentsInsertInfo(
+        scriptContent: string
+    ): Promise<{ type: 'existing'; insertOffset: number } | { type: 'new'; insertOffset: number } | null> {
+        const tree = await this.parseWithCache('typescript', scriptContent);
+        if (!tree) return null;
+
+        const exportStmt = this.findNodeByType(tree.rootNode, 'export_statement');
+        if (!exportStmt) return null;
+
+        const objectNode = this.findNodeByType(exportStmt, 'object');
+        if (!objectNode) return null;
+
+        // Look for existing components key
+        for (const child of objectNode.children) {
+            if (child.type === 'pair' || child.type === 'method_definition') {
+                const keyNode = child.childForFieldName('key') || child.childForFieldName('name');
+                if (keyNode?.text === 'components') {
+                    const valueNode = child.childForFieldName('value');
+                    if (valueNode?.type === 'object') {
+                        // Insert before the closing }
+                        return { type: 'existing', insertOffset: valueNode.endIndex - 1 };
+                    }
+                }
+            }
+        }
+
+        // No components key found: insert after the opening { of export default object
+        return { type: 'new', insertOffset: objectNode.startIndex + 1 };
+    }
+
+    /**
      * Extracts timeline events from a parsed AST tree for the Vue Timeline Outline feature.
      * This looks for lifecycle methods and watch definitions in the `export default` object.
      */
