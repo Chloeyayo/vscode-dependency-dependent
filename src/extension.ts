@@ -4,15 +4,20 @@ import { DepService } from "./DepService";
 import configWebpack from "./commands/configWebpack";
 import { getLoading, getLocked, setLoading, setLocked } from "./core/context";
 import { debounce } from "./core/debounce";
+import { computeFuncEnhance } from "./core/funcEnhance";
 import { reindentText } from "./core/indent";
 import { setContext } from "./share";
 import DepExplorerView from "./views/DepExplorerView";
 import { TreeSitterParser } from "./core/TreeSitterParser";
+import { VueTemplateCompletionProvider } from "./providers/VueTemplateCompletionProvider";
+import { VueRangeFormattingProvider } from "./providers/VueRangeFormattingProvider";
 
 import { WebpackDefinitionProvider } from "./providers/WebpackDefinitionProvider";
 import { VueOptionsDefinitionProvider } from "./providers/VueOptionsDefinitionProvider";
 import { VueOptionsCompletionProvider } from "./providers/VueOptionsCompletionProvider";
 import { UILibraryDefinitionProvider } from "./providers/UILibraryDefinitionProvider";
+import { VuePrototypeScanner } from "./core/VuePrototypeScanner";
+import { VueTimelineProvider } from "./views/VueTimelineProvider";
 
 export const log = vscode.window.createOutputChannel("Dependency & Dependent");
 
@@ -20,6 +25,9 @@ export const log = vscode.window.createOutputChannel("Dependency & Dependent");
 const BS_CLOSE_OPEN: Record<string, string> = { '}': '{', ']': '[', ')': '(' };
 // Block select: open→close bracket lookup
 const BS_OPEN_CLOSE: Record<string, string> = { '{': '}', '[': ']', '(': ')' };
+
+// Stored for deactivate() to cancel
+let _debouncedRefresh: ReturnType<typeof debounce> | undefined;
 
 export function activate(context: vscode.ExtensionContext) {
   log.appendLine("Extension activating...");
@@ -32,6 +40,10 @@ export function activate(context: vscode.ExtensionContext) {
   tsParser.init().catch(e => log.appendLine(`TreeSitter pre-init failed: ${e.message}`));
 
   new DepExplorerView(context);
+  const vueTimelineProvider = new VueTimelineProvider();
+  context.subscriptions.push(
+      vscode.window.registerTreeDataProvider('dependency-dependent-VueTimelineView', vueTimelineProvider)
+  );
   
   // Set up file system watcher for incremental dependency graph updates
   DepService.singleton.setupFileWatcher(context);
@@ -50,7 +62,8 @@ export function activate(context: vscode.ExtensionContext) {
   );
 
   // Register Definition Provider for Vue2 Options API
-  const vueOptionsProvider = new VueOptionsDefinitionProvider();
+  const sharedPrototypeScanner = new VuePrototypeScanner();
+  const vueOptionsProvider = new VueOptionsDefinitionProvider(sharedPrototypeScanner);
   const vueSelector = [{ scheme: "file", pattern: "**/*.vue" }];
   context.subscriptions.push(
     vscode.languages.registerDefinitionProvider(vueSelector, vueOptionsProvider)
@@ -62,13 +75,45 @@ export function activate(context: vscode.ExtensionContext) {
     vscode.languages.registerDefinitionProvider(vueSelector, uiLibProvider)
   );
 
-  // Register Completion Provider for Vue Options API (this.xxx)
-  const vueCompletionProvider = new VueOptionsCompletionProvider();
+  // Register Completion Provider for Vue Options API (this.xxx + this.$xxx)
+  const vueCompletionProvider = new VueOptionsCompletionProvider(sharedPrototypeScanner);
   context.subscriptions.push(
     vscode.languages.registerCompletionItemProvider(
       vueSelector,
       vueCompletionProvider,
-      '.'  // trigger on dot
+      '.', '$'  // trigger on dot and dollar sign
+    )
+  );
+
+  // Invalidate $xxx cache when root package.json changes (plugin deps may have changed)
+  // Use single-level glob to avoid firing on every node_modules/**/ package.json
+  const invalidateDebounced = debounce(() => vueCompletionProvider.invalidatePrototypeCache(), 1000);
+  const pkgWatcher = vscode.workspace.createFileSystemWatcher('*/package.json', false, false, false);
+  pkgWatcher.onDidChange(() => invalidateDebounced());
+  pkgWatcher.onDidCreate(() => invalidateDebounced());
+  pkgWatcher.onDidDelete(() => invalidateDebounced());
+  context.subscriptions.push(pkgWatcher);
+
+  // Register Completion Provider for Vue Template (Mustache, @event, :bind)
+  const vueTemplateCompletionProvider = new VueTemplateCompletionProvider();
+  context.subscriptions.push(
+    vscode.languages.registerCompletionItemProvider(
+      vueSelector,
+      vueTemplateCompletionProvider,
+      '{', '"', "'"  // trigger on {{ and attribute value quotes
+    )
+  );
+
+  // Register Formatting Providers for Vue files (Format Selection and Format Document)
+  const vueRangeFormattingProvider = new VueRangeFormattingProvider();
+  context.subscriptions.push(
+    vscode.languages.registerDocumentRangeFormattingEditProvider(
+      vueSelector,
+      vueRangeFormattingProvider
+    ),
+    vscode.languages.registerDocumentFormattingEditProvider(
+      vueSelector,
+      vueRangeFormattingProvider
     )
   );
 
@@ -125,44 +170,55 @@ export function activate(context: vscode.ExtensionContext) {
         }
       }
 
-      // --- 2. Quote scan (single forward pass, O(n)) ---
-      // Scan 0→L once, toggling open/close state per quote type.
-      // openAt[c]  = opening-quote offset if cursor is inside a c-string, else -1.
-      // lastOpen[c] = offset of the most recent opening quote (needed when cursor
-      //               lands exactly on a closing quote).
+      // --- 2. Quote scan (state-machine forward pass, O(n), comment-aware) ---
+      // States: code → string / line-comment / block-comment, with proper transitions.
+      // Quotes inside comments are ignored; \ skips the next char inside strings.
       let qStart = -1, qEnd = -1;
       {
-        const openAt:  Record<string, number> = { '"': -1, "'": -1, '`': -1 };
-        const lastOpen: Record<string, number> = { '"': -1, "'": -1, '`': -1 };
+        let state: 'code' | 'str' | 'line_cmt' | 'block_cmt' = 'code';
+        let strChar = '', strOpen = -1;
+        let lastStrChar = '', lastStrOpen = -1;
 
         for (let i = 0; i <= L; i++) {
           const c = text[i];
-          if (c !== '"' && c !== "'" && c !== '`') continue;
-          if (i > 0 && text[i - 1] === '\\') continue;
-          if (openAt[c] === -1) { openAt[c] = i; lastOpen[c] = i; }
-          else                  { openAt[c] = -1; }
+          switch (state) {
+            case 'code':
+              if      (c === '/' && text[i + 1] === '/') { state = 'line_cmt';  i++; }
+              else if (c === '/' && text[i + 1] === '*') { state = 'block_cmt'; i++; }
+              else if (c === '"' || c === "'" || c === '`') {
+                state = 'str'; strChar = c; strOpen = i;
+              }
+              break;
+            case 'str':
+              if      (c === '\\')    { i++; }              // skip escaped char
+              else if (c === strChar) {
+                lastStrChar = strChar; lastStrOpen = strOpen;
+                state = 'code'; strChar = ''; strOpen = -1;
+              }
+              break;
+            case 'line_cmt':  if (c === '\n') state = 'code'; break;
+            case 'block_cmt': if (c === '*' && text[i + 1] === '/') { state = 'code'; i++; } break;
+          }
         }
 
-        let bestSpan = Infinity;
-        for (const c of ['"', "'", '`']) {
-          let oPos = -1, cPos = -1;
+        // Resolve opening/closing positions from state after scan
+        let oPos = -1, cPos = -1, qChar = '';
+        if (state === 'str') {
+          // Cursor is inside (or on the opening quote of) the string
+          oPos = strOpen; qChar = strChar;
+        } else if (lastStrOpen !== -1 && L < len && text[L] === lastStrChar && (L === 0 || text[L - 1] !== '\\')) {
+          // Cursor is ON the closing quote of the most recently closed string
+          oPos = lastStrOpen; cPos = L; qChar = lastStrChar;
+        }
 
-          if (openAt[c] !== -1) {
-            // Cursor is inside (or on the opening of) a c-string.
-            oPos = openAt[c];
-            // j starts at oPos+1 ≥ 1, so text[j-1] is always in-bounds.
+        if (oPos !== -1) {
+          if (cPos === -1) {
+            // Find closing quote from oPos+1 (j ≥ 1, so text[j-1] is always in-bounds)
             for (let j = oPos + 1; j < len; j++) {
-              if (text[j] === c && text[j - 1] !== '\\') { cPos = j; break; }
+              if (text[j] === qChar && text[j - 1] !== '\\') { cPos = j; break; }
             }
-          } else if (lastOpen[c] !== -1 && L < len && text[L] === c && (L === 0 || text[L - 1] !== '\\')) {
-            // Cursor is ON the closing quote of a c-string.
-            oPos = lastOpen[c];
-            cPos = L;
           }
-
-          if (oPos === -1 || cPos === -1 || cPos < R) continue;
-          const span = cPos + 1 - oPos;
-          if (span < bestSpan) { bestSpan = span; qStart = oPos; qEnd = cPos + 1; }
+          if (cPos !== -1 && cPos >= R) { qStart = oPos; qEnd = cPos + 1; }
         }
       }
 
@@ -196,7 +252,7 @@ export function activate(context: vscode.ExtensionContext) {
   );
 
   const config = vscode.workspace.getConfiguration("dependencyDependent");
-  const debounceDelay = config.get<number>("debounceDelay") || 300;
+  const debounceDelay = config.get<number>("debounceDelay") || 0;
 
   // Debounced refresh to prevent rapid updates when switching tabs quickly
   const debouncedRefresh = debounce(() => {
@@ -207,8 +263,11 @@ export function activate(context: vscode.ExtensionContext) {
 
     DepExplorerView.singleton.refresh();
   }, debounceDelay);
+  _debouncedRefresh = debouncedRefresh;
 
-  vscode.window.onDidChangeActiveTextEditor(debouncedRefresh);
+  context.subscriptions.push(
+    vscode.window.onDidChangeActiveTextEditor(debouncedRefresh)
+  );
 
   context.subscriptions.push(
     vscode.commands.registerCommand(
@@ -307,6 +366,56 @@ export function activate(context: vscode.ExtensionContext) {
     )
   );
 
+  context.subscriptions.push(
+      vscode.commands.registerCommand(
+          "dependency-dependent.vueTimeline.jumpToLocation",
+          (item) => {
+              if (item) {
+                  vueTimelineProvider.jumpToLocation(item);
+              }
+          }
+      )
+  );
+
+  // --- Func Enhance (Alt+Enter) ---
+  context.subscriptions.push(
+    vscode.commands.registerCommand(
+      "dependency-dependent.funcEnhance",
+      async () => {
+        const editor = vscode.window.activeTextEditor;
+        if (!editor) return;
+
+        const enabled = vscode.workspace
+          .getConfiguration("dependencyDependent")
+          .get<boolean>("funcEnhance", true);
+        if (!enabled) return;
+
+        const doc = editor.document;
+        const pos = editor.selection.active;
+        const lines = doc.getText().split('\n');
+        const insertSpaces = editor.options.insertSpaces as boolean;
+        const tabSizeNum = editor.options.tabSize as number;
+        const tabSize = insertSpaces ? ' '.repeat(tabSizeNum) : '\t';
+
+        const result = computeFuncEnhance(lines, pos.line, pos.character, tabSize);
+        if (!result) return;
+
+        if (result.actionType === 'insert') {
+          const lineEnd = new vscode.Position(pos.line, doc.lineAt(pos.line).text.length);
+          await editor.edit(eb => eb.insert(lineEnd, result.insertText));
+          const newPos = new vscode.Position(result.cursorLine, result.cursorChar);
+          editor.selection = new vscode.Selection(newPos, newPos);
+        } else {
+          // snippet: replace entire line
+          const lineRange = doc.lineAt(pos.line).range;
+          await editor.edit(eb => eb.replace(lineRange, result.insertText));
+          const newPos = new vscode.Position(result.cursorLine, result.cursorChar);
+          editor.selection = new vscode.Selection(newPos, newPos);
+        }
+      }
+    )
+  );
+
   // --- Paste and Indent ---
   let pasteSelectAfter = vscode.workspace
     .getConfiguration("dependencyDependent")
@@ -386,4 +495,9 @@ export function activate(context: vscode.ExtensionContext) {
   );
 }
 
-export function deactivate() {}
+export function deactivate() {
+  _debouncedRefresh?.cancel();
+  DepService.singleton.dispose();
+  TreeSitterParser.getInstance().dispose();
+  DepExplorerView.singleton?.dispose();
+}

@@ -19,6 +19,9 @@ export class TreeSitterParser {
     private parsers: Map<string, Parser> = new Map();
     private languages: Map<string, Parser.Language> = new Map();
     private importQueries: Map<string, Parser.Query> = new Map();
+    private identifierImportQuery: Map<string, Parser.Query> = new Map();
+    private parserLoading: Map<string, Promise<Parser | undefined>> = new Map();
+    private treeCache: Map<string, { hash: number; tree: any }> = new Map();
     private wasmDir: string;
     private initialized = false;
 
@@ -40,6 +43,20 @@ export class TreeSitterParser {
              TreeSitterParser.instance = new TreeSitterParser(wasmPath);
         }
         return TreeSitterParser.instance;
+    }
+
+    public dispose(): void {
+        for (const cached of this.treeCache.values()) {
+            cached.tree?.delete?.();
+        }
+        this.treeCache.clear();
+        this.parsers.clear();
+        this.languages.clear();
+        this.importQueries.clear();
+        this.identifierImportQuery.clear();
+        this.parserLoading.clear();
+        this.initialized = false;
+        TreeSitterParser.instance = undefined!;
     }
 
     public async init(): Promise<void> {
@@ -80,6 +97,22 @@ export class TreeSitterParser {
             return this.parsers.get(langId);
         }
 
+        // Prevent concurrent loads of the same language (race condition → WASM leak)
+        if (this.parserLoading.has(langId)) {
+            return this.parserLoading.get(langId);
+        }
+
+        const loadPromise = this._loadParser(langId);
+        this.parserLoading.set(langId, loadPromise);
+
+        try {
+            return await loadPromise;
+        } finally {
+            this.parserLoading.delete(langId);
+        }
+    }
+
+    private async _loadParser(langId: string): Promise<Parser | undefined> {
         const wasmFile = LANG_WASM_MAP[langId];
         if (!wasmFile) {
             return undefined;
@@ -93,26 +126,62 @@ export class TreeSitterParser {
 
         try {
             log.appendLine(`Loading language WASM: ${wasmPath}`);
-            const wasmBinary = fs.readFileSync(wasmPath);
-            log.appendLine(`WASM binary size: ${wasmBinary.length}`);
+            const wasmBinary = await fs.promises.readFile(wasmPath);
             const lang = await Parser.Language.load(new Uint8Array(wasmBinary));
-            log.appendLine(`Language loaded for ${langId}`);
             const parser = new Parser();
             parser.setLanguage(lang);
 
             this.languages.set(langId, lang);
             this.parsers.set(langId, parser);
+            log.appendLine(`Language loaded for ${langId}`);
 
             return parser;
         } catch (e: any) {
             log.appendLine(`Failed to load parser for ${langId}: ${e.message || e}`);
-            log.appendLine(`Error stack: ${e.stack}`);
             return undefined;
         }
     }
 
     public getLanguage(langId: string): Parser.Language | undefined {
         return this.languages.get(langId);
+    }
+
+    /**
+     * Parse content with a per-language last-tree cache.
+     * If the same content (by hash) was parsed before for this language,
+     * the cached tree is returned immediately (zero cost).
+     * Old trees are automatically deleted when replaced.
+     */
+    private async parseWithCache(langId: string, content: string): Promise<any | null> {
+        const parser = await this.getParser(langId);
+        if (!parser) return null;
+
+        const hash = this.hashContent(content);
+        const cached = this.treeCache.get(langId);
+
+        if (cached && cached.hash === hash) {
+            return cached.tree;
+        }
+
+        // Delete old cached tree to free WASM memory
+        if (cached) {
+            cached.tree.delete();
+        }
+
+        const tree = parser.parse(content);
+        if (tree) {
+            this.treeCache.set(langId, { hash, tree });
+        }
+        return tree;
+    }
+
+    /** djb2 hash — fast O(n) hash for content identity checks */
+    private hashContent(content: string): number {
+        let hash = 5381;
+        for (let i = 0, len = content.length; i < len; i++) {
+            hash = ((hash << 5) + hash + content.charCodeAt(i)) | 0;
+        }
+        return hash;
     }
 
     public async extractImports(content: string, filePath: string): Promise<string[]> {
@@ -128,15 +197,10 @@ export class TreeSitterParser {
             return [];
         }
 
-        const parser = await this.getParser(langId);
-        if (!parser) return [];
-
-        const tree = parser.parse(content);
+        const tree = await this.parseWithCache(langId, content);
         if (!tree) return [];
 
-        const imports = this.queryImports(tree, langId);
-        tree.delete();
-        return imports;
+        return this.queryImports(tree, langId);
     }
 
     public getLangId(filePath: string): string | undefined {
@@ -226,22 +290,15 @@ export class TreeSitterParser {
 
         const { scriptContent, scriptOffset } = scriptInfo;
 
-        const tsParser = await this.getParser('typescript');
-        if (!tsParser) return null;
-
-        const tsTree = tsParser.parse(scriptContent);
+        const tsTree = await this.parseWithCache('typescript', scriptContent);
         if (!tsTree) return null;
 
-        try {
-            const result = this.findOptionPropertyInTree(tsTree, targetWord);
-            if (result) {
-                return {
-                    start: scriptOffset + result.start,
-                    end: scriptOffset + result.end
-                };
-            }
-        } finally {
-            tsTree.delete();
+        const result = this.findOptionPropertyInTree(tsTree, targetWord);
+        if (result) {
+            return {
+                start: scriptOffset + result.start,
+                end: scriptOffset + result.end
+            };
         }
 
         return null;
@@ -249,27 +306,20 @@ export class TreeSitterParser {
 
     /**
      * Collect all Vue Options API property names from a .vue file.
-     * Returns an array of { name, source } where source is 'data' | 'methods' | 'computed' | 'props'.
+     * Returns an array of { name, source } where source is 'data' | 'methods' | 'computed' | 'props' | 'watch'.
      */
     public async collectVueOptionProperties(
         content: string
-    ): Promise<{ name: string; source: 'data' | 'methods' | 'computed' | 'props' }[]> {
+    ): Promise<{ name: string; source: 'data' | 'methods' | 'computed' | 'props' | 'watch' }[]> {
         const scriptInfo = this.extractVueScriptInfo(content);
         if (!scriptInfo) return [];
 
         const { scriptContent } = scriptInfo;
 
-        const tsParser = await this.getParser('typescript');
-        if (!tsParser) return [];
-
-        const tsTree = tsParser.parse(scriptContent);
+        const tsTree = await this.parseWithCache('typescript', scriptContent);
         if (!tsTree) return [];
 
-        try {
-            return this.collectOptionPropertiesInTree(tsTree);
-        } finally {
-            tsTree.delete();
-        }
+        return this.collectOptionPropertiesInTree(tsTree);
     }
 
     /**
@@ -278,9 +328,9 @@ export class TreeSitterParser {
      */
     private collectOptionPropertiesInTree(
         tree: any
-    ): { name: string; source: 'data' | 'methods' | 'computed' | 'props' }[] {
+    ): { name: string; source: 'data' | 'methods' | 'computed' | 'props' | 'watch' }[] {
         const root = tree.rootNode;
-        const results: { name: string; source: 'data' | 'methods' | 'computed' | 'props' }[] = [];
+        const results: { name: string; source: 'data' | 'methods' | 'computed' | 'props' | 'watch' }[] = [];
 
         const exportStmt = this.findNodeByType(root, 'export_statement');
         if (!exportStmt) return results;
@@ -295,9 +345,9 @@ export class TreeSitterParser {
 
                 const keyName = keyNode.text;
 
-                // methods / computed / props: collect all keys from the value object
-                if (['methods', 'computed', 'props'].includes(keyName)) {
-                    const source = keyName as 'methods' | 'computed' | 'props';
+                // methods / computed / props / watch: collect all keys from the value object
+                if (['methods', 'computed', 'props', 'watch'].includes(keyName)) {
+                    const source = keyName as 'methods' | 'computed' | 'props' | 'watch';
                     const valueNode = child.childForFieldName('value');
 
                     if (valueNode && valueNode.type === 'object') {
@@ -342,7 +392,7 @@ export class TreeSitterParser {
      */
     private collectPropertyNames(
         objectNode: any,
-        source: 'data' | 'methods' | 'computed' | 'props',
+        source: 'data' | 'methods' | 'computed' | 'props' | 'watch',
         results: { name: string; source: typeof source }[]
     ): void {
         for (const child of objectNode.children) {
@@ -453,32 +503,25 @@ export class TreeSitterParser {
             return null;
         }
 
-        const parser = await this.getParser(langId);
-        if (!parser) return null;
-
-        const tree = parser.parse(content);
+        const tree = await this.parseWithCache(langId, content);
         if (!tree) return null;
 
-        try {
-            const node = tree.rootNode.descendantForIndex(offset);
-            if (!node) return null;
+        const node = tree.rootNode.descendantForIndex(offset);
+        if (!node) return null;
 
-            if (node.type === 'string_fragment' || node.type === 'string') {
-                let current = node;
-                while (current) {
-                    if (current.type === 'import_statement' ||
-                        current.type === 'export_statement' ||
-                        (current.type === 'call_expression' &&
-                         current.childForFieldName('function')?.text === 'require')) {
-                        const text = node.type === 'string_fragment' ? node.text :
-                                     node.text.substring(1, node.text.length - 1);
-                        return text;
-                    }
-                    current.parent && (current = current.parent);
+        if (node.type === 'string_fragment' || node.type === 'string') {
+            let current: any = node;
+            while (current) {
+                if (current.type === 'import_statement' ||
+                    current.type === 'export_statement' ||
+                    (current.type === 'call_expression' &&
+                     current.childForFieldName('function')?.text === 'require')) {
+                    const text = node.type === 'string_fragment' ? node.text :
+                                 node.text.substring(1, node.text.length - 1);
+                    return text;
                 }
+                current = current.parent;
             }
-        } finally {
-            tree.delete();
         }
 
         return null;
@@ -499,70 +542,244 @@ export class TreeSitterParser {
             return this.findImportPathForIdentifier(scriptInfo.scriptContent, 'temp.ts', identifier);
         }
 
-        const parser = await this.getParser(langId);
-        if (!parser) return null;
-
-        const tree = parser.parse(content);
+        const tree = await this.parseWithCache(langId, content);
         if (!tree) return null;
 
-        try {
-            const language = this.languages.get(langId);
-            if (!language) return null;
+        const query = this.getIdentifierImportQuery(langId);
+        if (!query) return null;
 
-            const queryString = `
-                (import_statement
-                    (import_clause
-                        (identifier) @default_import
-                    )
-                    source: (string) @source
-                )
-                (import_statement
-                    (import_clause
-                        (named_imports
-                            (import_specifier
-                                name: (identifier) @named_import
-                            )
-                        )
-                    )
-                    source: (string) @source
-                )
-            `;
+        const matches = query.matches(tree.rootNode);
 
-            let query: Parser.Query;
-            try {
-                query = language.query(queryString);
-            } catch (e) {
-                log.appendLine(`Failed to create import query: ${e}`);
-                return null;
-            }
+        for (const match of matches) {
+            let foundIdentifier = false;
+            let sourcePath: string | null = null;
 
-            const matches = query.matches(tree.rootNode);
-
-            for (const match of matches) {
-                let foundIdentifier = false;
-                let sourcePath: string | null = null;
-
-                for (const capture of match.captures) {
-                    if ((capture.name === 'default_import' || capture.name === 'named_import') &&
-                        capture.node.text === identifier) {
-                        foundIdentifier = true;
-                    }
-                    if (capture.name === 'source') {
-                        const text = capture.node.text;
-                        sourcePath = text.substring(1, text.length - 1);
-                    }
+            for (const capture of match.captures) {
+                if ((capture.name === 'default_import' || capture.name === 'named_import') &&
+                    capture.node.text === identifier) {
+                    foundIdentifier = true;
                 }
-
-                if (foundIdentifier && sourcePath) {
-                    query.delete();
-                    return sourcePath;
+                if (capture.name === 'source') {
+                    const text = capture.node.text;
+                    sourcePath = text.substring(1, text.length - 1);
                 }
             }
-            query.delete();
-        } finally {
-            tree.delete();
+
+            if (foundIdentifier && sourcePath) {
+                return sourcePath;
+            }
         }
 
         return null;
+    }
+
+    private getIdentifierImportQuery(langId: string): Parser.Query | null {
+        const cached = this.identifierImportQuery.get(langId);
+        if (cached) return cached;
+
+        const language = this.languages.get(langId);
+        if (!language) return null;
+
+        const queryString = `
+            (import_statement
+                (import_clause
+                    (identifier) @default_import
+                )
+                source: (string) @source
+            )
+            (import_statement
+                (import_clause
+                    (named_imports
+                        (import_specifier
+                            name: (identifier) @named_import
+                        )
+                    )
+                )
+                source: (string) @source
+            )
+        `;
+
+        try {
+            const query = language.query(queryString);
+            this.identifierImportQuery.set(langId, query);
+            return query;
+        } catch (e) {
+            log.appendLine(`Failed to create identifier import query: ${e}`);
+            return null;
+        }
+    }
+
+    /**
+     * Extracts timeline events from a parsed AST tree for the Vue Timeline Outline feature.
+     * This looks for lifecycle methods and watch definitions in the `export default` object.
+     */
+    public async getVueTimelineEvents(content: string): Promise<any[]> {
+        const langId = 'typescript';
+        const tree = await this.parseWithCache(langId, content);
+        if (!tree) return [];
+
+        const root = tree.rootNode;
+        const events: any[] = [];
+
+        const exportStmt = this.findNodeByType(root, 'export_statement');
+        if (!exportStmt) return events;
+
+        const objectNode = this.findNodeByType(exportStmt, 'object');
+        if (!objectNode) return events;
+
+        const LIFECYCLES = new Set([
+            'beforeCreate', 'created', 'beforeMount', 'mounted', 
+            'beforeUpdate', 'updated', 'activated', 'deactivated', 
+            'beforeDestroy', 'destroyed', 'errorCaptured'
+        ]);
+
+        for (const child of objectNode.children) {
+             const keyNode = child.childForFieldName('key') || child.childForFieldName('name');
+             if (!keyNode) continue;
+             const keyName = keyNode.text;
+
+             // Extract lifecycle hooks
+             if (child.type === 'method_definition' && LIFECYCLES.has(keyName)) {
+                 const actions = this.extractActionsFromStatements(child.childForFieldName('body'));
+                 events.push({
+                     type: 'lifecycle',
+                     name: keyName,
+                     start: child.startIndex,
+                     end: child.endIndex,
+                     actions
+                 });
+             }
+
+             // Extract properties that are lifecycle hooks (e.g., created: function() { ... } or created: () => { ... })
+             if (child.type === 'pair' && LIFECYCLES.has(keyName)) {
+                 const valueNode = child.childForFieldName('value');
+                 if (valueNode && (valueNode.type === 'function_expression' || valueNode.type === 'arrow_function')) {
+                     const bodyNode = valueNode.childForFieldName('body');
+                     const actions = this.extractActionsFromStatements(bodyNode);
+                     events.push({
+                         type: 'lifecycle',
+                         name: keyName,
+                         start: child.startIndex,
+                         end: child.endIndex,
+                         actions
+                     });
+                 }
+             }
+
+             // Extract watch
+             if (child.type === 'pair' && keyName === 'watch') {
+                 const watchObj = child.childForFieldName('value');
+                 if (watchObj && watchObj.type === 'object') {
+                     for (const watchChild of watchObj.children) {
+                         const wKeyNode = watchChild.childForFieldName('key') || watchChild.childForFieldName('name');
+                         if (!wKeyNode) continue;
+                         const wKeyName = wKeyNode.text.replace(/^['"`]|['"`]$/g, ''); // strip quotes
+                         
+                         let wBodyNode = null;
+                         let isImmediate = false;
+                         if (watchChild.type === 'method_definition') {
+                             wBodyNode = watchChild.childForFieldName('body');
+                         } else if (watchChild.type === 'pair') {
+                             const wValueNode = watchChild.childForFieldName('value');
+                             if (wValueNode && (wValueNode.type === 'function_expression' || wValueNode.type === 'arrow_function')) {
+                                 wBodyNode = wValueNode.childForFieldName('body');
+                             } else if (wValueNode && wValueNode.type === 'object') {
+                                 // object syntax: watch: { foo: { handler() { ... } } }
+                                 let handlerFound = false;
+                                 for (const opt of wValueNode.children) {
+                                     const optKey = opt.childForFieldName('key') || opt.childForFieldName('name');
+                                     if (optKey && optKey.text === 'handler') {
+                                         if (opt.type === 'method_definition') {
+                                             wBodyNode = opt.childForFieldName('body');
+                                         } else if (opt.type === 'pair') {
+                                             const handlerVal = opt.childForFieldName('value');
+                                             if (handlerVal && (handlerVal.type === 'function_expression' || handlerVal.type === 'arrow_function')) {
+                                                 wBodyNode = handlerVal.childForFieldName('body');
+                                             }
+                                         }
+                                         handlerFound = true;
+                                     } else if (optKey && optKey.text === 'immediate') {
+                                         if (opt.type === 'pair') {
+                                             const immVal = opt.childForFieldName('value');
+                                             if (immVal && immVal.text === 'true') {
+                                                 isImmediate = true;
+                                             }
+                                         }
+                                     }
+                                 }
+                             }
+                         }
+
+                         if (wBodyNode) {
+                             const actions = this.extractActionsFromStatements(wBodyNode);
+                             events.push({
+                                 type: 'watch',
+                                 name: `watch('${wKeyName}')`,
+                                 start: watchChild.startIndex,
+                                 end: watchChild.endIndex,
+                                 actions,
+                                 isImmediate
+                             });
+                         }
+                     }
+                 }
+             }
+        }
+
+        return events;
+    }
+
+    private extractActionsFromStatements(blockNode: any): any[] {
+        if (!blockNode) return [];
+        
+        const actions: any[] = [];
+        const processNode = (node: any) => {
+            if (!node) return;
+
+            // Method calls: this.fetchData(...) or this.$store.dispatch(...)
+            if (node.type === 'call_expression') {
+                const funcNode = node.childForFieldName('function');
+                if (funcNode && funcNode.type === 'member_expression') {
+                    const objectNode = funcNode.childForFieldName('object');
+                    if (objectNode && objectNode.text === 'this' || (objectNode.type === 'member_expression' && objectNode.text.startsWith('this.'))) {
+                        actions.push({
+                            type: 'call',
+                            label: `${funcNode.text}()`,
+                            start: node.startIndex,
+                            end: node.endIndex
+                        });
+                    }
+                }
+            }
+            
+            // Assignments: this.someProp = ...
+            if (node.type === 'assignment_expression') {
+                const leftNode = node.childForFieldName('left');
+                if (leftNode && leftNode.type === 'member_expression') {
+                    const objectNode = leftNode.childForFieldName('object');
+                    if (objectNode && objectNode.text === 'this') {
+                        actions.push({
+                            type: 'assignment',
+                            label: `${leftNode.text} =`,
+                            start: node.startIndex,
+                            end: node.endIndex
+                        });
+                    }
+                }
+            }
+
+            for (const child of node.children) {
+                processNode(child);
+            }
+        };
+
+        for (const stmt of blockNode.children) {
+             processNode(stmt);
+        }
+
+        // Sort actions chronologically
+        actions.sort((a, b) => a.start - b.start);
+
+        return actions;
     }
 }

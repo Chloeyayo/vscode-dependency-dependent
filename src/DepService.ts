@@ -23,6 +23,18 @@ export class DepService {
 
   constructor() {}
 
+  dispose() {
+    for (const graph of this.graphs.values()) {
+      graph.dispose();
+    }
+    this.graphs.clear();
+    if (this.watcher) {
+      this.watcher.dispose();
+      this.watcher = undefined;
+    }
+    singletonInstance = undefined!;
+  }
+
   // ─── Public API ────────────────────────────────────────────
 
   async getDependencies(uri?: vscode.Uri): Promise<string[]> {
@@ -96,6 +108,10 @@ export class DepService {
     }
 
     // Delete existing graph to force re-initialization
+    const oldGraph = this.graphs.get(fsPath);
+    if (oldGraph) {
+      oldGraph.dispose();
+    }
     this.graphs.delete(fsPath);
     await this.getGraphForWorkspace(workspace);
 

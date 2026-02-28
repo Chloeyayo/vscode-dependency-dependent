@@ -21,7 +21,6 @@ export class WebpackDefinitionProvider implements vscode.DefinitionProvider {
     position: vscode.Position,
     token: vscode.CancellationToken
   ): Promise<vscode.Definition | undefined> {
-    log.appendLine(`provideDefinition called for ${document.uri.fsPath}`);
 
     const fileContent = document.getText();
     const offset = document.offsetAt(position);
@@ -101,6 +100,8 @@ export class WebpackDefinitionProvider implements vscode.DefinitionProvider {
 
     if (!this.resolver) return undefined;
 
+    if (token.isCancellationRequested) return undefined;
+
     return new Promise((resolve) => {
       this.resolver.resolve(
         {},
@@ -126,6 +127,11 @@ export class WebpackDefinitionProvider implements vscode.DefinitionProvider {
 
   private async initResolver(workspace: vscode.WorkspaceFolder) {
     this.lastWorkspace = workspace.uri.fsPath;
+
+    // Purge old resolver's cached file system before creating a new one
+    if (this.resolver?.fileSystem?.purge) {
+      this.resolver.fileSystem.purge();
+    }
 
     const webpackConfigFn = await DepService.getWebpackConfigFn();
     let resolveConfig: any = {

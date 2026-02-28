@@ -22,7 +22,7 @@
       ]
     },
     "template-block": {
-      "begin": "(<)(template)(\\b[^>]*)(>)",
+      "begin": "^(<)(template)(\\b[^>]*)(>)",
       "beginCaptures": {
         "1": { "name": "punctuation.definition.tag.begin.html.vue" },
         "2": { "name": "entity.name.tag.html.vue" },
@@ -31,7 +31,7 @@
         },
         "4": { "name": "punctuation.definition.tag.end.html.vue" }
       },
-      "end": "(</)(template)(\\s*>)",
+      "end": "^(</)(template)(\\s*>)",
       "endCaptures": {
         "1": { "name": "punctuation.definition.tag.begin.html.vue" },
         "2": { "name": "entity.name.tag.html.vue" },
@@ -40,8 +40,9 @@
       "name": "meta.template.block.vue",
       "patterns": [
         { "include": "#vue-interpolation" },
-        { "include": "#vue-directives" },
-        { "include": "text.html.basic" }
+        { "include": "#html-comment" },
+        { "include": "#html-tags" },
+        { "include": "#html-entities" }
       ]
     },
     "script-block-ts": {
@@ -125,35 +126,6 @@
         { "include": "source.js" }
       ]
     },
-    "vue-directives": {
-      "patterns": [
-        {
-          "match": "\\b(v-(?:if|else-if|else|for|show|model|bind|on|slot|pre|cloak|once|text|html|memo))\\b",
-          "name": "keyword.control.directive.vue"
-        },
-        {
-          "match": "(@)([-\\w]+)",
-          "captures": {
-            "1": { "name": "keyword.operator.event.vue" },
-            "2": { "name": "entity.other.attribute-name.event.vue" }
-          }
-        },
-        {
-          "match": "(:)([-\\w]+)",
-          "captures": {
-            "1": { "name": "keyword.operator.binding.vue" },
-            "2": { "name": "entity.other.attribute-name.binding.vue" }
-          }
-        },
-        {
-          "match": "(#)([-\\w]+)",
-          "captures": {
-            "1": { "name": "keyword.operator.slot.vue" },
-            "2": { "name": "entity.other.attribute-name.slot.vue" }
-          }
-        }
-      ]
-    },
     "tag-attributes": {
       "patterns": [
         {
@@ -176,6 +148,200 @@
           "begin": "'",
           "end": "'",
           "name": "string.quoted.single.html.vue"
+        }
+      ]
+    },
+    "html-comment": {
+      "begin": "<!--",
+      "end": "-->",
+      "name": "comment.block.html.vue",
+      "patterns": [
+        {
+          "match": "\\b(TODO|FIXME|HACK|XXX|NOTE)\\b",
+          "name": "keyword.other.todo.vue"
+        }
+      ]
+    },
+    "html-entities": {
+      "match": "&([a-zA-Z]+|#[0-9]+|#x[0-9a-fA-F]+);",
+      "name": "constant.character.entity.html.vue"
+    },
+    "html-tags": {
+      "patterns": [
+        {
+          "comment": "Self-closing tags: <br/>, <MyComponent />",
+          "begin": "(<)([a-zA-Z][a-zA-Z0-9]*(?:-[a-zA-Z0-9]+)*)\\b",
+          "beginCaptures": {
+            "1": { "name": "punctuation.definition.tag.begin.html.vue" },
+            "2": { "name": "entity.name.tag.html.vue" }
+          },
+          "end": "(/?>)",
+          "endCaptures": {
+            "1": { "name": "punctuation.definition.tag.end.html.vue" }
+          },
+          "name": "meta.tag.html.vue",
+          "patterns": [
+            { "include": "#html-tag-attributes" }
+          ]
+        },
+        {
+          "comment": "Closing tags: </div>, </el-table-column>",
+          "match": "(</)([a-zA-Z][a-zA-Z0-9]*(?:-[a-zA-Z0-9]+)*)(\\s*>)",
+          "captures": {
+            "1": { "name": "punctuation.definition.tag.begin.html.vue" },
+            "2": { "name": "entity.name.tag.html.vue" },
+            "3": { "name": "punctuation.definition.tag.end.html.vue" }
+          }
+        }
+      ]
+    },
+    "html-tag-attributes": {
+      "patterns": [
+        {
+          "comment": "Event handler (double-quoted): @click.stop.prevent=\"addRole()\" or v-on:click=\"handler\"",
+          "begin": "((?:@|v-on:)[\\w-]+(?:\\.[\\w-]+)*)\\s*(=)\\s*(\")",
+          "beginCaptures": {
+            "1": { "name": "entity.other.attribute-name.event.vue" },
+            "2": { "name": "punctuation.separator.key-value.html.vue" },
+            "3": { "name": "punctuation.definition.string.begin.html.vue" }
+          },
+          "end": "\"",
+          "endCaptures": {
+            "0": { "name": "punctuation.definition.string.end.html.vue" }
+          },
+          "name": "meta.directive.event.vue",
+          "patterns": [
+            { "include": "source.js" }
+          ]
+        },
+        {
+          "comment": "Event handler (single-quoted)",
+          "begin": "((?:@|v-on:)[\\w-]+(?:\\.[\\w-]+)*)\\s*(=)\\s*(')",
+          "beginCaptures": {
+            "1": { "name": "entity.other.attribute-name.event.vue" },
+            "2": { "name": "punctuation.separator.key-value.html.vue" },
+            "3": { "name": "punctuation.definition.string.begin.html.vue" }
+          },
+          "end": "'",
+          "endCaptures": {
+            "0": { "name": "punctuation.definition.string.end.html.vue" }
+          },
+          "name": "meta.directive.event.vue",
+          "patterns": [
+            { "include": "source.js" }
+          ]
+        },
+        {
+          "comment": "Bound attribute (double-quoted): :prop.sync=\"value\" or v-bind:prop=\"data\"",
+          "begin": "((?::|v-bind:)[\\w-]+(?:\\.[\\w-]+)*)\\s*(=)\\s*(\")",
+          "beginCaptures": {
+            "1": { "name": "entity.other.attribute-name.binding.vue" },
+            "2": { "name": "punctuation.separator.key-value.html.vue" },
+            "3": { "name": "punctuation.definition.string.begin.html.vue" }
+          },
+          "end": "\"",
+          "endCaptures": {
+            "0": { "name": "punctuation.definition.string.end.html.vue" }
+          },
+          "name": "meta.directive.binding.vue",
+          "patterns": [
+            { "include": "source.js" }
+          ]
+        },
+        {
+          "comment": "Bound attribute (single-quoted)",
+          "begin": "((?::|v-bind:)[\\w-]+(?:\\.[\\w-]+)*)\\s*(=)\\s*(')",
+          "beginCaptures": {
+            "1": { "name": "entity.other.attribute-name.binding.vue" },
+            "2": { "name": "punctuation.separator.key-value.html.vue" },
+            "3": { "name": "punctuation.definition.string.begin.html.vue" }
+          },
+          "end": "'",
+          "endCaptures": {
+            "0": { "name": "punctuation.definition.string.end.html.vue" }
+          },
+          "name": "meta.directive.binding.vue",
+          "patterns": [
+            { "include": "source.js" }
+          ]
+        },
+        {
+          "comment": "Vue directive value (double-quoted): v-if=\"condition\" v-model.lazy=\"value\" v-for=\"item in list\"",
+          "begin": "(v-(?:if|else-if|show|model|for|text|html|memo)(?:\\.[\\w-]+)*)\\s*(=)\\s*(\")",
+          "beginCaptures": {
+            "1": { "name": "keyword.control.directive.vue" },
+            "2": { "name": "punctuation.separator.key-value.html.vue" },
+            "3": { "name": "punctuation.definition.string.begin.html.vue" }
+          },
+          "end": "\"",
+          "endCaptures": {
+            "0": { "name": "punctuation.definition.string.end.html.vue" }
+          },
+          "name": "meta.directive.control.vue",
+          "patterns": [
+            { "include": "source.js" }
+          ]
+        },
+        {
+          "comment": "Vue directive value (single-quoted)",
+          "begin": "(v-(?:if|else-if|show|model|for|text|html|memo)(?:\\.[\\w-]+)*)\\s*(=)\\s*(')",
+          "beginCaptures": {
+            "1": { "name": "keyword.control.directive.vue" },
+            "2": { "name": "punctuation.separator.key-value.html.vue" },
+            "3": { "name": "punctuation.definition.string.begin.html.vue" }
+          },
+          "end": "'",
+          "endCaptures": {
+            "0": { "name": "punctuation.definition.string.end.html.vue" }
+          },
+          "name": "meta.directive.control.vue",
+          "patterns": [
+            { "include": "source.js" }
+          ]
+        },
+        {
+          "comment": "Vue directives without value: v-else, v-pre, v-cloak, v-once",
+          "match": "\\b(v-(?:else|pre|cloak|once|slot))\\b",
+          "name": "keyword.control.directive.vue"
+        },
+        {
+          "comment": "v-slot shorthand: #slot",
+          "match": "(#)([-\\w]+)",
+          "captures": {
+            "1": { "name": "keyword.operator.slot.vue" },
+            "2": { "name": "entity.other.attribute-name.slot.vue" }
+          }
+        },
+        {
+          "comment": "Standard or kebab-case attribute with =",
+          "match": "([-\\w.]+)\\s*(=)",
+          "captures": {
+            "1": { "name": "entity.other.attribute-name.html.vue" },
+            "2": { "name": "punctuation.separator.key-value.html.vue" }
+          }
+        },
+        {
+          "comment": "Boolean attribute without value",
+          "match": "\\b([a-zA-Z][-\\w]*)\\b(?!=)",
+          "name": "entity.other.attribute-name.html.vue"
+        },
+        {
+          "comment": "Double-quoted attribute value (plain, non-directive)",
+          "begin": "\"",
+          "end": "\"",
+          "name": "string.quoted.double.html.vue",
+          "patterns": [
+            { "include": "#vue-interpolation" }
+          ]
+        },
+        {
+          "comment": "Single-quoted attribute value (plain, non-directive)",
+          "begin": "'",
+          "end": "'",
+          "name": "string.quoted.single.html.vue",
+          "patterns": [
+            { "include": "#vue-interpolation" }
+          ]
         }
       ]
     }

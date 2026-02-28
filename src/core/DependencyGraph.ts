@@ -34,6 +34,9 @@ export class DependencyGraph {
   /** Promise tracking the current initialization */
   private initPromise: Promise<void> | null = null;
 
+  /** Interval for purging CachedInputFileSystem */
+  private purgeInterval: ReturnType<typeof setInterval> | null = null;
+
   constructor(workspaceRoot: string) {
     this.workspaceRoot = workspaceRoot;
   }
@@ -79,6 +82,16 @@ export class DependencyGraph {
       modules: resolveConfig.modules || ["node_modules"],
       preferRelative: true,
     });
+
+    // Periodically purge the file system cache to prevent memory accumulation
+    // in long-running sessions with large projects
+    if (!this.purgeInterval) {
+      this.purgeInterval = setInterval(() => {
+        if (this.resolver?.fileSystem?.purge) {
+          this.resolver.fileSystem.purge();
+        }
+      }, 30_000);
+    }
   }
 
   /**
@@ -143,10 +156,10 @@ export class DependencyGraph {
   async processFile(filePath: string): Promise<void> {
     const normalizedPath = vscode.Uri.file(filePath).fsPath;
 
-    // Read file content
+    // Read file content (async to avoid blocking extension host)
     let content: string;
     try {
-      content = fs.readFileSync(filePath, "utf-8");
+      content = await fs.promises.readFile(filePath, "utf-8");
     } catch {
       // File might have been deleted
       this.removeFile(normalizedPath);
@@ -273,5 +286,22 @@ export class DependencyGraph {
 
   isInitialized(): boolean {
     return this.initialized;
+  }
+
+  dispose() {
+    if (this.purgeInterval) {
+      clearInterval(this.purgeInterval);
+      this.purgeInterval = null;
+    }
+
+    if (this.resolver?.fileSystem?.purge) {
+      this.resolver.fileSystem.purge();
+    }
+    this.resolver = null;
+
+    this.dependencyMap.clear();
+    this.dependentMap.clear();
+    this.initialized = false;
+    this.initPromise = null;
   }
 }

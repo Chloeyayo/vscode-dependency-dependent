@@ -29,8 +29,6 @@ export default class DepExplorerView
 
   public static viewId = "dependency-dependent-DepExplorerView";
 
-  protected context: vscode.ExtensionContext;
-
   protected treeView: vscode.TreeView<DepTreeItem>;
 
   protected currentRootUri?: vscode.Uri;
@@ -43,12 +41,19 @@ export default class DepExplorerView
   constructor(context: vscode.ExtensionContext) {
     depExplorerView = this;
 
-    this.context = context;
-
     this.treeView = vscode.window.createTreeView(DepExplorerView.viewId, {
       treeDataProvider: this,
       showCollapseAll: true,
     });
+
+    context.subscriptions.push(this._onDidChangeTreeData);
+    context.subscriptions.push(this.treeView);
+  }
+
+  dispose() {
+    this._onDidChangeTreeData.dispose();
+    this.treeView.dispose();
+    depExplorerView = undefined!;
   }
 
   public refresh() {

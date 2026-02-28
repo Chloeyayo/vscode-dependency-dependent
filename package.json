@@ -60,19 +60,26 @@
         },
         "dependencyDependent.debounceDelay": {
           "type": "number",
-          "default": 300,
+          "default": 0,
           "description": "Debounce delay for refreshing the tree view (ms)."
         },
-        "dependencyDependent.cacheTTL": {
-          "type": "number",
-          "default": 30000,
-          "markdownDeprecationMessage": "No longer used. The dependency graph is now updated incrementally.",
-          "description": "(Deprecated) Cache time-to-live for dependency maps (ms)."
+        "dependencyDependent.funcEnhance": {
+          "type": "boolean",
+          "default": true,
+          "description": "Enable Alt+Enter smart code generation (function enhance)."
         },
         "dependencyDependent.pasteAndIndent.selectAfter": {
           "type": "boolean",
           "default": false,
           "description": "After pasting and indenting, select the pasted region."
+        },
+        "dependencyDependent.vue.customDollarProperties": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": [],
+          "description": "Custom Vue instance $xxx properties for this.$ completion (e.g. [\"$api\", \"$bus\"]). The $ prefix is auto-added if omitted."
         }
       }
     },
@@ -82,6 +89,11 @@
           "id": "dependency-dependent-DepExplorerView",
           "name": "%extension.DepExplorerView.name%",
           "icon": "$(type-hierarchy)"
+        },
+        {
+          "id": "dependency-dependent-VueTimelineView",
+          "name": "Vue 2 Timeline",
+          "icon": "$(history)"
         }
       ]
     },
@@ -89,6 +101,10 @@
       {
         "view": "dependency-dependent-DepExplorerView",
         "contents": "Loading..."
+      },
+      {
+        "view": "dependency-dependent-VueTimelineView",
+        "contents": "Open a Vue SFC file to see its lifecycle timeline."
       }
     ],
     "menus": {
@@ -140,6 +156,11 @@
         "category": "Dependency & Dependent"
       },
       {
+        "command": "dependency-dependent.vueTimeline.jumpToLocation",
+        "title": "Jump to Timeline Location",
+        "category": "Dependency & Dependent"
+      },
+      {
         "command": "dependency-dependent.configEntryPoints",
         "title": "%extension.configEntryPoints.title%",
         "category": "Dependency & Dependent"
@@ -170,6 +191,11 @@
         "command": "dependency-dependent.pasteAndIndent",
         "title": "%extension.pasteAndIndent.title%",
         "category": "Dependency & Dependent"
+      },
+      {
+        "command": "dependency-dependent.funcEnhance",
+        "title": "Func Enhance",
+        "category": "Dependency & Dependent"
       }
     ],
     "keybindings": [
@@ -183,6 +209,11 @@
         "command": "dependency-dependent.pasteAndIndent",
         "key": "ctrl+shift+v",
         "mac": "cmd+shift+v",
+        "when": "editorTextFocus"
+      },
+      {
+        "command": "dependency-dependent.funcEnhance",
+        "key": "alt+enter",
         "when": "editorTextFocus"
       }
     ],

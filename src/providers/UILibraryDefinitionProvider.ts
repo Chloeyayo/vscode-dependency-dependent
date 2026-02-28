@@ -31,15 +31,6 @@ const LIBRARY_MAP: Record<string, LibraryConfig> = {
       "lib/${kebabCaseName}.js"
     ]
   },
-  "element-plus": {
-    prefix: "el-",
-    sourceTemplate: "packages/components/${kebabCaseName}/src/index.vue",
-    fallbackTemplates: [
-      "packages/components/${kebabCaseName}/src/${kebabCaseName}.vue",
-      "packages/components/${kebabCaseName}/index.ts",
-      "es/components/${kebabCaseName}/index.mjs"
-    ]
-  },
   "ant-design-vue": {
     prefix: "a-",
     sourceTemplate: "components/${kebabCaseName}/index.jsx",
@@ -65,20 +56,22 @@ const LIBRARY_MAP: Record<string, LibraryConfig> = {
  */
 export class UILibraryDefinitionProvider implements vscode.DefinitionProvider {
 
-  provideDefinition(
+  async provideDefinition(
     document: vscode.TextDocument,
     position: vscode.Position,
     token: vscode.CancellationToken
-  ): vscode.ProviderResult<vscode.Definition> {
+  ): Promise<vscode.Definition | null> {
     // Get the word (tag name) at cursor
     const wordRange = document.getWordRangeAtPosition(position, /[\w-]+/);
-    if (!wordRange) return;
+    if (!wordRange) return null;
+
+    if (token.isCancellationRequested) return null;
 
     const tagName = document.getText(wordRange).toLowerCase();
 
     // Try to resolve using our strategy map
-    const resolvedPath = this.resolveComponentPath(tagName, document.uri.fsPath);
-    
+    const resolvedPath = await this.resolveComponentPath(tagName, document.uri.fsPath);
+
     if (resolvedPath) {
       return new vscode.Location(
         vscode.Uri.file(resolvedPath),
@@ -93,7 +86,7 @@ export class UILibraryDefinitionProvider implements vscode.DefinitionProvider {
    * Resolve component source path using Node.js module resolution
    * This handles pnpm, yarn workspaces, and monorepos correctly
    */
-  private resolveComponentPath(tagName: string, currentFilePath: string): string | null {
+  private async resolveComponentPath(tagName: string, currentFilePath: string): Promise<string | null> {
     // Find matching library by prefix
     const libEntry = Object.entries(LIBRARY_MAP).find(([_, config]) =>
       tagName.startsWith(config.prefix)
@@ -123,8 +116,11 @@ export class UILibraryDefinitionProvider implements vscode.DefinitionProvider {
         const relativePath = template.replace(/\$\{kebabCaseName\}/g, kebabName);
         const targetPath = path.join(pkgRoot, relativePath);
 
-        if (fs.existsSync(targetPath)) {
+        try {
+          await fs.promises.access(targetPath);
           return targetPath;
+        } catch {
+          // Template path doesn't exist, try next
         }
       }
 

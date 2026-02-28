@@ -1,3 +1,8 @@
+export interface Debounced<T extends (...args: any[]) => any> {
+  (...args: Parameters<T>): void;
+  cancel(): void;
+}
+
 /**
  * Creates a debounced version of a function that delays execution
  * until after `delay` milliseconds have elapsed since the last call.
@@ -5,10 +10,10 @@
 export function debounce<T extends (...args: any[]) => any>(
   fn: T,
   delay: number
-): (...args: Parameters<T>) => void {
+): Debounced<T> {
   let timeoutId: ReturnType<typeof setTimeout> | undefined;
 
-  return function (this: any, ...args: Parameters<T>) {
+  const debounced = function (this: any, ...args: Parameters<T>) {
     if (timeoutId !== undefined) {
       clearTimeout(timeoutId);
     }
@@ -17,7 +22,16 @@ export function debounce<T extends (...args: any[]) => any>(
       timeoutId = undefined;
       fn.apply(this, args);
     }, delay);
+  } as Debounced<T>;
+
+  debounced.cancel = () => {
+    if (timeoutId !== undefined) {
+      clearTimeout(timeoutId);
+      timeoutId = undefined;
+    }
   };
+
+  return debounced;
 }
 
 /**
