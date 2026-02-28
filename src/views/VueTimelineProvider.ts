@@ -1,5 +1,4 @@
 import * as vscode from 'vscode';
-import * as path from 'path';
 import { VueTimelineAnalyzer, TimelineEvent, TimelineAction } from '../core/VueTimelineAnalyzer';
 import { VariableTrackingResult, CallChainStep } from '../core/VueVariableTracker';
 
@@ -38,7 +37,7 @@ export class TimelineTreeItem extends vscode.TreeItem {
 export class TrackingTreeItem extends vscode.TreeItem {
     constructor(
         public readonly label: string,
-        public readonly trackingType: 'root' | 'data-init' | 'entry' | 'call' | 'assignment',
+        public readonly trackingType: 'root' | 'data-init' | 'entry' | 'watch-entry' | 'call' | 'assignment',
         public readonly start: number,
         public readonly end: number,
         public readonly uri: vscode.Uri,
@@ -58,6 +57,9 @@ export class TrackingTreeItem extends vscode.TreeItem {
                 break;
             case 'entry':
                 this.iconPath = new vscode.ThemeIcon('symbol-event');
+                break;
+            case 'watch-entry':
+                this.iconPath = new vscode.ThemeIcon('eye');
                 break;
             case 'call':
                 this.iconPath = new vscode.ThemeIcon('arrow-right');
@@ -260,10 +262,10 @@ export class VueTimelineProvider implements vscode.TreeDataProvider<AnyTreeItem>
             // Lifecycle/watcher entry points
             for (let i = 0; i < result.paths.length; i++) {
                 const p = result.paths[i];
-                const icon = p.entryType === 'watch' ? 'watch' : 'entry';
+                const entryTrackingType = p.entryType === 'watch' ? 'watch-entry' as const : 'entry' as const;
                 items.push(new TrackingTreeItem(
                     p.entryName,
-                    'entry',
+                    entryTrackingType,
                     p.entryStart, p.entryEnd, uri,
                     vscode.TreeItemCollapsibleState.Expanded,
                     p.callChain,
@@ -275,7 +277,7 @@ export class VueTimelineProvider implements vscode.TreeDataProvider<AnyTreeItem>
         }
 
         // Entry or call node with children
-        if (element instanceof TrackingTreeItem && (element.trackingType === 'entry' || element.trackingType === 'call')) {
+        if (element instanceof TrackingTreeItem && (element.trackingType === 'entry' || element.trackingType === 'watch-entry' || element.trackingType === 'call')) {
             const steps = element.children;
             if (!steps || steps.length === 0) return Promise.resolve([]);
 

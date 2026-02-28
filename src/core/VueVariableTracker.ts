@@ -175,11 +175,11 @@ export class VueVariableTracker {
     }
 
     private truncateExpression(expr: string): string {
-        // Extract right-hand side of assignment
-        const eqIdx = expr.indexOf('=');
-        if (eqIdx === -1) return expr;
-        const rhs = expr.substring(eqIdx + 1).trim();
-        // Truncate long expressions
+        // Extract right-hand side of assignment.
+        // Match the first standalone `=` that is NOT part of `==`, `===`, `!=`, `<=`, `>=`, `=>`
+        const match = expr.match(/(?<!=|!)=(?!=|>)/);
+        if (!match || match.index === undefined) return expr;
+        const rhs = expr.substring(match.index + 1).trim();
         if (rhs.length > 40) {
             return rhs.substring(0, 37) + '...';
         }
