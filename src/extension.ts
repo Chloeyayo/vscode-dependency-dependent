@@ -433,7 +433,7 @@ export function activate(context: vscode.ExtensionContext) {
 
               await vueTimelineProvider.enterTrackingMode(variableName, document);
               // Reveal the timeline view
-              vueTimelineView.reveal(undefined as any, { focus: true }).catch(() => {
+              vueTimelineView.reveal(undefined as any, { focus: true }).then(undefined, () => {
                   // View may not support reveal without an element, just focus
                   vscode.commands.executeCommand('dependency-dependent-VueTimelineView.focus');
               });

@@ -251,8 +251,13 @@
     "languages": [
       {
         "id": "vue",
-        "aliases": ["Vue", "vue"],
-        "extensions": [".vue"],
+        "aliases": [
+          "Vue",
+          "vue"
+        ],
+        "extensions": [
+          ".vue"
+        ],
         "configuration": "./language-configuration.json"
       }
     ],
@@ -272,7 +277,9 @@
     "typescriptServerPlugins": [
       {
         "name": "./dist/ts-plugin",
-        "languages": ["vue"]
+        "languages": [
+          "vue"
+        ]
       }
     ]
   },

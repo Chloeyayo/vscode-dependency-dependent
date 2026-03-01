@@ -924,4 +924,306 @@ export class TreeSitterParser {
 
         return filteredActions;
     }
+
+    /**
+     * Build a call graph for a Vue component's script content.
+     * Returns all methods (lifecycle, watcher, and regular) with their call sites,
+     * assignment sites, and data initial values.
+     */
+    public async buildComponentCallGraph(scriptContent: string): Promise<{
+        methods: Map<string, {
+            name: string;
+            calls: { methodName: string; start: number; end: number }[];
+            assignments: { variableName: string; fullExpression: string; start: number; end: number }[];
+            start: number;
+            end: number;
+            isLifecycle?: boolean;
+            isWatcher?: boolean;
+            watchTarget?: string;
+        }>;
+        dataInitialValues: Map<string, { variableName: string; valueText: string; start: number; end: number }>;
+    }> {
+        const methods = new Map<string, {
+            name: string;
+            calls: { methodName: string; start: number; end: number }[];
+            assignments: { variableName: string; fullExpression: string; start: number; end: number }[];
+            start: number;
+            end: number;
+            isLifecycle?: boolean;
+            isWatcher?: boolean;
+            watchTarget?: string;
+        }>();
+        const dataInitialValues = new Map<string, { variableName: string; valueText: string; start: number; end: number }>();
+
+        const tree = await this.parseWithCache('typescript', scriptContent);
+        if (!tree) return { methods, dataInitialValues };
+
+        const root = tree.rootNode;
+        const exportStmt = this.findNodeByType(root, 'export_statement');
+        if (!exportStmt) return { methods, dataInitialValues };
+
+        const objectNode = this.findNodeByType(exportStmt, 'object');
+        if (!objectNode) return { methods, dataInitialValues };
+
+        const LIFECYCLES = new Set([
+            'beforeCreate', 'created', 'beforeMount', 'mounted',
+            'beforeUpdate', 'updated', 'activated', 'deactivated',
+            'beforeDestroy', 'destroyed', 'errorCaptured',
+            'serverPrefetch', 'renderTracked', 'renderTriggered'
+        ]);
+
+        for (const child of objectNode.children) {
+            const keyNode = child.childForFieldName('key') || child.childForFieldName('name');
+            if (!keyNode) continue;
+            const keyName = keyNode.text;
+
+            // --- data(): extract initial values ---
+            if (keyName === 'data') {
+                const bodyNode = child.childForFieldName('body') ||
+                    child.childForFieldName('value')?.childForFieldName('body');
+                if (bodyNode) {
+                    const returnStmt = this.findNodeByType(bodyNode, 'return_statement');
+                    if (returnStmt) {
+                        const returnObj = this.findNodeByType(returnStmt, 'object');
+                        if (returnObj) {
+                            for (const prop of returnObj.children) {
+                                if (prop.type === 'pair') {
+                                    const pKey = prop.childForFieldName('key');
+                                    const pVal = prop.childForFieldName('value');
+                                    if (pKey && pVal) {
+                                        dataInitialValues.set(pKey.text, {
+                                            variableName: pKey.text,
+                                            valueText: pVal.text,
+                                            start: prop.startIndex,
+                                            end: prop.endIndex,
+                                        });
+                                    }
+                                } else if (prop.type === 'shorthand_property_identifier') {
+                                    dataInitialValues.set(prop.text, {
+                                        variableName: prop.text,
+                                        valueText: prop.text,
+                                        start: prop.startIndex,
+                                        end: prop.endIndex,
+                                    });
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            // --- methods: extract method definitions ---
+            if (keyName === 'methods') {
+                const valueNode = child.childForFieldName('value');
+                if (valueNode && valueNode.type === 'object') {
+                    for (const methodChild of valueNode.children) {
+                        const mKeyNode = methodChild.childForFieldName('key') || methodChild.childForFieldName('name');
+                        if (!mKeyNode) continue;
+                        const mBodyNode = methodChild.childForFieldName('body') ||
+                            methodChild.childForFieldName('value')?.childForFieldName('body');
+                        if (mBodyNode) {
+                            const { calls, assigns } = this.extractCallsAndAssignments(mBodyNode);
+                            methods.set(mKeyNode.text, {
+                                name: mKeyNode.text,
+                                calls,
+                                assignments: assigns,
+                                start: methodChild.startIndex,
+                                end: methodChild.endIndex,
+                            });
+                        }
+                    }
+                }
+            }
+
+            // --- lifecycle hooks ---
+            if (LIFECYCLES.has(keyName)) {
+                let bodyNode: any = null;
+                if (child.type === 'method_definition') {
+                    bodyNode = child.childForFieldName('body');
+                } else if (child.type === 'pair') {
+                    const valueNode = child.childForFieldName('value');
+                    if (valueNode && (valueNode.type === 'function_expression' || valueNode.type === 'arrow_function')) {
+                        bodyNode = valueNode.childForFieldName('body');
+                    }
+                }
+                if (bodyNode) {
+                    const { calls, assigns } = this.extractCallsAndAssignments(bodyNode);
+                    methods.set(keyName, {
+                        name: keyName,
+                        calls,
+                        assignments: assigns,
+                        start: child.startIndex,
+                        end: child.endIndex,
+                        isLifecycle: true,
+                    });
+                }
+            }
+
+            // --- watch ---
+            if (keyName === 'watch' && child.type === 'pair') {
+                const watchObj = child.childForFieldName('value');
+                if (watchObj && watchObj.type === 'object') {
+                    for (const watchChild of watchObj.children) {
+                        const wKeyNode = watchChild.childForFieldName('key') || watchChild.childForFieldName('name');
+                        if (!wKeyNode) continue;
+                        const wKeyName = wKeyNode.text.replace(/^['"`]|['"`]$/g, '');
+
+                        let wBodyNode: any = null;
+                        if (watchChild.type === 'method_definition') {
+                            wBodyNode = watchChild.childForFieldName('body');
+                        } else if (watchChild.type === 'pair') {
+                            const wValueNode = watchChild.childForFieldName('value');
+                            if (wValueNode && (wValueNode.type === 'function_expression' || wValueNode.type === 'arrow_function')) {
+                                wBodyNode = wValueNode.childForFieldName('body');
+                            } else if (wValueNode && wValueNode.type === 'object') {
+                                for (const opt of wValueNode.children) {
+                                    const optKey = opt.childForFieldName('key') || opt.childForFieldName('name');
+                                    if (optKey && optKey.text === 'handler') {
+                                        if (opt.type === 'method_definition') {
+                                            wBodyNode = opt.childForFieldName('body');
+                                        } else if (opt.type === 'pair') {
+                                            const handlerVal = opt.childForFieldName('value');
+                                            if (handlerVal && (handlerVal.type === 'function_expression' || handlerVal.type === 'arrow_function')) {
+                                                wBodyNode = handlerVal.childForFieldName('body');
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
+                        if (wBodyNode) {
+                            const watchKey = `watch:${wKeyName}`;
+                            const { calls, assigns } = this.extractCallsAndAssignments(wBodyNode);
+                            methods.set(watchKey, {
+                                name: `watch('${wKeyName}')`,
+                                calls,
+                                assignments: assigns,
+                                start: watchChild.startIndex,
+                                end: watchChild.endIndex,
+                                isWatcher: true,
+                                watchTarget: wKeyName,
+                            });
+                        }
+                    }
+                }
+            }
+        }
+
+        return { methods, dataInitialValues };
+    }
+
+    /**
+     * Extract method calls (this.xxx()) and assignments (this.xxx = ...) from a block node.
+     */
+    private extractCallsAndAssignments(blockNode: any): {
+        calls: { methodName: string; start: number; end: number }[];
+        assigns: { variableName: string; fullExpression: string; start: number; end: number }[];
+    } {
+        const calls: { methodName: string; start: number; end: number }[] = [];
+        const assigns: { variableName: string; fullExpression: string; start: number; end: number }[] = [];
+
+        const walk = (node: any) => {
+            if (!node) return;
+
+            if (node.type === 'call_expression') {
+                const funcNode = node.childForFieldName('function');
+                if (funcNode && funcNode.type === 'member_expression') {
+                    const objNode = funcNode.childForFieldName('object');
+                    const propNode = funcNode.childForFieldName('property');
+                    if (objNode && objNode.text === 'this' && propNode) {
+                        calls.push({
+                            methodName: propNode.text,
+                            start: node.startIndex,
+                            end: node.endIndex,
+                        });
+                    }
+                }
+            }
+
+            if (node.type === 'assignment_expression') {
+                const leftNode = node.childForFieldName('left');
+                if (leftNode && leftNode.type === 'member_expression') {
+                    const objNode = leftNode.childForFieldName('object');
+                    const propNode = leftNode.childForFieldName('property');
+                    if (objNode && objNode.text === 'this' && propNode) {
+                        assigns.push({
+                            variableName: propNode.text,
+                            fullExpression: node.text,
+                            start: node.startIndex,
+                            end: node.endIndex,
+                        });
+                    }
+                }
+            }
+
+            if (node.children && Array.isArray(node.children)) {
+                for (const child of node.children) {
+                    walk(child);
+                }
+            }
+        };
+
+        walk(blockNode);
+        return { calls, assigns };
+    }
+
+    /**
+     * Find the byte offset after the last import statement in script content.
+     * If there are no imports, returns 0 (insert at start).
+     */
+    public async findLastImportEndOffset(scriptContent: string): Promise<number> {
+        const tree = await this.parseWithCache('typescript', scriptContent);
+        if (!tree) return 0;
+
+        const root = tree.rootNode;
+        let lastImportEnd = 0;
+
+        for (const child of root.children) {
+            if (child.type === 'import_statement') {
+                lastImportEnd = child.endIndex;
+            }
+        }
+
+        return lastImportEnd;
+    }
+
+    /**
+     * Find where to insert a component registration in the Vue Options API.
+     * Returns:
+     *  - type: 'existing' — components:{} already exists, insertOffset is before the closing }
+     *  - type: 'new' — no components:{}, insertOffset is after the opening { of export default {}
+     *  - null — no export default found
+     */
+    public async findComponentsInsertInfo(
+        scriptContent: string
+    ): Promise<{ type: 'existing' | 'new'; insertOffset: number } | null> {
+        const tree = await this.parseWithCache('typescript', scriptContent);
+        if (!tree) return null;
+
+        const root = tree.rootNode;
+        const exportStmt = this.findNodeByType(root, 'export_statement');
+        if (!exportStmt) return null;
+
+        const objectNode = this.findNodeByType(exportStmt, 'object');
+        if (!objectNode) return null;
+
+        // Look for existing `components` property
+        for (const child of objectNode.children) {
+            if (child.type === 'pair' || child.type === 'method_definition') {
+                const keyNode = child.childForFieldName('key') || child.childForFieldName('name');
+                if (keyNode && keyNode.text === 'components') {
+                    const valueNode = child.childForFieldName('value');
+                    if (valueNode && valueNode.type === 'object') {
+                        // Insert before the closing }
+                        const closeBrace = valueNode.endIndex - 1;
+                        return { type: 'existing', insertOffset: closeBrace };
+                    }
+                }
+            }
+        }
+
+        // No components found — insert after the opening { of the export default object
+        return { type: 'new', insertOffset: objectNode.startIndex + 1 };
+    }
 }

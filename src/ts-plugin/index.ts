@@ -12,6 +12,8 @@
  *   by returning `undefined` from `getCompletionsAtPosition`.
  */
 
+import type ts from "typescript/lib/tsserverlibrary";
+
 function init(modules: { typescript: typeof import("typescript/lib/tsserverlibrary") }) {
   const ts = modules.typescript;
 
