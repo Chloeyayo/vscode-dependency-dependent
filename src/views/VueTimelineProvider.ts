@@ -1,6 +1,7 @@
 import * as vscode from 'vscode';
 import { VueTimelineAnalyzer, TimelineEvent, TimelineAction } from '../core/VueTimelineAnalyzer';
 import { VariableTrackingResult, CallChainStep } from '../core/VueVariableTracker';
+import { log } from '../log';
 
 export class TimelineTreeItem extends vscode.TreeItem {
     constructor(
@@ -156,9 +157,10 @@ export class VueTimelineProvider implements vscode.TreeDataProvider<AnyTreeItem>
             this.currentUri = document.uri;
             const content = document.getText();
             this.currentEvents = await this.analyzer.analyze(content);
+            log.appendLine(`[Timeline] refresh: ${this.currentEvents.length} events found for ${document.fileName}`);
             this._onDidChangeTreeData.fire();
-        } catch (e) {
-            console.error("VueTimelineProvider error:", e);
+        } catch (e: any) {
+            log.appendLine(`[Timeline] refresh ERROR: ${e.message}`);
             this.clear();
         }
     }
@@ -171,15 +173,21 @@ export class VueTimelineProvider implements vscode.TreeDataProvider<AnyTreeItem>
 
     public async enterTrackingMode(variableName: string, document: vscode.TextDocument): Promise<void> {
         try {
+            log.appendLine(`[Timeline] enterTrackingMode: variable="${variableName}", file=${document.fileName}`);
             this.trackingMode = true;
             this.trackingVariableName = variableName;
             this.currentUri = document.uri;
             const content = document.getText();
+            log.appendLine(`[Timeline] Document content length: ${content.length}`);
             this.trackingResult = await this.analyzer.trackVariable(content, variableName, document.uri);
+            log.appendLine(`[Timeline] Tracking result: dataInit=${!!this.trackingResult.dataInit}, paths=${this.trackingResult.paths.length}`);
+            for (const p of this.trackingResult.paths) {
+                log.appendLine(`[Timeline]   path: ${p.entryName} (${p.entryType}), chain steps=${p.callChain.length}`);
+            }
             vscode.commands.executeCommand('setContext', 'dependency-dependent.trackingMode', true);
             this._onDidChangeTreeData.fire();
-        } catch (e) {
-            console.error("VueTimelineProvider tracking error:", e);
+        } catch (e: any) {
+            log.appendLine(`[Timeline] enterTrackingMode ERROR: ${e.message}\n${e.stack}`);
             this.exitTrackingMode();
         }
     }

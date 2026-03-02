@@ -1,6 +1,7 @@
 import * as vscode from 'vscode';
 import { TreeSitterParser } from './TreeSitterParser';
 import { VueVariableTracker, VariableTrackingResult } from './VueVariableTracker';
+import { log } from '../log';
 
 export interface TimelineEvent {
     type: 'lifecycle' | 'watch';
@@ -59,9 +60,11 @@ export class VueTimelineAnalyzer {
     public async analyze(content: string): Promise<TimelineEvent[]> {
         const scriptInfo = this.treeSitterParser.extractVueScriptInfo(content);
         if (!scriptInfo) {
+            log.appendLine('[Timeline] analyze: No <script> block found in Vue SFC');
             return [];
         }
 
+        log.appendLine(`[Timeline] analyze: script block found, offset=${scriptInfo.scriptOffset}, length=${scriptInfo.scriptContent.length}`);
         const { scriptContent, scriptOffset } = scriptInfo;
         const events = await this._analyzeTypeScript(scriptContent, scriptOffset);
         

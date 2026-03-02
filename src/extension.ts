@@ -20,8 +20,9 @@ import { VueOptionsCompletionProvider } from "./providers/VueOptionsCompletionPr
 import { UILibraryDefinitionProvider } from "./providers/UILibraryDefinitionProvider";
 import { VuePrototypeScanner } from "./core/VuePrototypeScanner";
 import { VueTimelineProvider } from "./views/VueTimelineProvider";
+import { log } from "./log";
 
-export const log = vscode.window.createOutputChannel("Dependency & Dependent");
+export { log };
 
 // Block select: close→open bracket lookup (< > excluded: they're comparison/generic operators in JS/TS)
 const BS_CLOSE_OPEN: Record<string, string> = { '}': '{', ']': '[', ')': '(' };
@@ -462,15 +463,29 @@ export function activate(context: vscode.ExtensionContext) {
       vscode.commands.registerCommand(
           "dependency-dependent.vueTimeline.trackVariable",
           async () => {
+              log.appendLine('[Timeline] trackVariable command triggered');
               const editor = vscode.window.activeTextEditor;
-              if (!editor || editor.document.languageId !== 'vue') return;
+              if (!editor) {
+                  log.appendLine('[Timeline] No active editor');
+                  return;
+              }
+              log.appendLine(`[Timeline] languageId: ${editor.document.languageId}, file: ${editor.document.fileName}`);
+              if (editor.document.languageId !== 'vue') {
+                  log.appendLine('[Timeline] Not a .vue file, skipping');
+                  return;
+              }
 
               const document = editor.document;
               const position = editor.selection.active;
               const wordRange = document.getWordRangeAtPosition(position, /[$\w]+/);
-              if (!wordRange) return;
+              if (!wordRange) {
+                  log.appendLine(`[Timeline] No word at cursor position (line ${position.line}, char ${position.character})`);
+                  vscode.window.showInformationMessage('Place cursor on a variable name to track.');
+                  return;
+              }
 
               let variableName = document.getText(wordRange);
+              log.appendLine(`[Timeline] Word at cursor: "${variableName}"`);
 
               // Check if preceded by "this." — allow clicking on either "this" or the property
               const lineText = document.lineAt(position.line).text;
@@ -482,24 +497,28 @@ export function activate(context: vscode.ExtensionContext) {
                   const propMatch = afterThis.match(/^\.(\w+)/);
                   if (propMatch) {
                       variableName = propMatch[1];
+                      log.appendLine(`[Timeline] Resolved "this." → "${variableName}"`);
                   } else {
+                      log.appendLine('[Timeline] Cursor on "this" but no property after dot');
+                      vscode.window.showInformationMessage('Place cursor on this.propertyName to track.');
                       return;
                   }
               } else if (wordStart >= 5 && lineText.substring(wordStart - 5, wordStart) === 'this.') {
-                  // Already have the property name, preceded by "this."
+                  log.appendLine(`[Timeline] Detected this.${variableName}`);
               } else {
-                  // Not a this.xxx pattern — still allow tracking by property name
+                  log.appendLine(`[Timeline] Tracking by standalone name: "${variableName}"`);
               }
 
               // Skip $-prefixed properties
-              if (variableName.startsWith('$')) return;
+              if (variableName.startsWith('$')) {
+                  log.appendLine(`[Timeline] Skipping $-prefixed property: ${variableName}`);
+                  return;
+              }
 
+              log.appendLine(`[Timeline] Entering tracking mode for "${variableName}"...`);
               await vueTimelineProvider.enterTrackingMode(variableName, document);
-              // Reveal the timeline view
-              vueTimelineView.reveal(undefined as any, { focus: true }).then(undefined, () => {
-                  // View may not support reveal without an element, just focus
-                  vscode.commands.executeCommand('dependency-dependent-VueTimelineView.focus');
-              });
+              // Focus the timeline view
+              vscode.commands.executeCommand('dependency-dependent-VueTimelineView.focus');
           }
       )
   );
