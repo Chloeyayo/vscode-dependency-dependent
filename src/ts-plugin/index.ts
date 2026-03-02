@@ -45,6 +45,7 @@ function init(modules: { typescript: typeof import("typescript/lib/tsserverlibra
       const scriptCloseRe = /<\/script\s*>/i;
 
       const openMatch = scriptOpenRe.exec(text);
+      logger.info(`[vue-ts-plugin] extractScript: text length=${text.length}, openMatch=${openMatch ? `index=${openMatch.index}, match="${openMatch[0]}"` : 'null'}`);
       if (!openMatch) {
         // No <script> block — return all spaces (preserving newlines)
         return { content: padAll(text), scriptKind: ts.ScriptKind.JS };
@@ -127,6 +128,7 @@ function init(modules: { typescript: typeof import("typescript/lib/tsserverlibra
     host.getScriptSnapshot = (fileName: string) => {
       if (isVueFile(fileName)) {
         const { content } = getExtracted(fileName);
+        logger.info(`[vue-ts-plugin] getScriptSnapshot for ${fileName}, content length=${content.length}, first 100 chars: ${JSON.stringify(content.slice(0, 100))}`);
         return ts.ScriptSnapshot.fromString(content);
       }
       return origGetScriptSnapshot(fileName);
@@ -219,7 +221,11 @@ function init(modules: { typescript: typeof import("typescript/lib/tsserverlibra
     return proxy;
   }
 
-  return { create };
+  function getExternalFiles(project: ts.server.Project): string[] {
+    return project.getFileNames().filter(f => f.endsWith(".vue"));
+  }
+
+  return { create, getExternalFiles };
 }
 
 export = init;

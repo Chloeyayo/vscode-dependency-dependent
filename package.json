@@ -80,6 +80,10 @@
           },
           "default": [],
           "description": "Custom Vue instance $xxx properties for this.$ completion (e.g. [\"$api\", \"$bus\"]). The $ prefix is auto-added if omitted."
+        },
+        "typescript-plugins.suggest.enabled": {
+          "type": "boolean",
+          "default": true
         }
       }
     },
@@ -279,7 +283,8 @@
         "name": "./dist/ts-plugin",
         "languages": [
           "vue"
-        ]
+        ],
+        "enableForWorkspaceTypeScriptVersions": true
       }
     ]
   },

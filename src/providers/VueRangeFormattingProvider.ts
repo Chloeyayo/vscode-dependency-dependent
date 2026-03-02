@@ -4,6 +4,8 @@ import * as vscode from "vscode";
  * SFC region info: the block's content range within the Vue file.
  */
 interface SFCRegion {
+  /** Tag name: template, script, or style */
+  tagName: string;
   /** Language id for the virtual document */
   langId: string;
   /** Offset of the first char of the block content (after the opening tag's >) */
@@ -92,45 +94,47 @@ export class VueRangeFormattingProvider implements vscode.DocumentRangeFormattin
     const regions = this.parseRegions(text);
     const allEdits: vscode.TextEdit[] = [];
 
+    const eol = document.eol === vscode.EndOfLine.CRLF ? "\r\n" : "\n";
+    const indent = options.insertSpaces ? " ".repeat(options.tabSize) : "\t";
+
     for (let i = 0; i < regions.length; i++) {
       if (_token.isCancellationRequested) break;
       const region = regions[i];
       const regionContent = text.substring(region.contentStart, region.contentEnd);
 
+      // Strip leading/trailing whitespace to get pure content for formatting
+      const trimmed = regionContent.replace(/^\r?\n/, '').replace(/\r?\n[\t ]*$/, '');
+
       let virtualDoc: vscode.TextDocument | undefined;
       try {
-        virtualDoc = await this.openVirtualDoc(region.langId, regionContent);
-
-        // Preserve structural newlines between block tags and content
-        // e.g. the \n after <template> and the \n before </template>
-        const leadingNL = regionContent.match(/^\r?\n/);
-        const trailingNL = regionContent.match(/\r?\n[\t ]*$/);
-        const formatStart = leadingNL ? leadingNL[0].length : 0;
-        const formatEnd = trailingNL ? regionContent.length - trailingNL[0].length : regionContent.length;
-
-        const virtualRange = new vscode.Range(
-          virtualDoc.positionAt(formatStart),
-          virtualDoc.positionAt(formatEnd)
-        );
+        virtualDoc = await this.openVirtualDoc(region.langId, trimmed);
 
         const edits = await vscode.commands.executeCommand<vscode.TextEdit[]>(
-          'vscode.executeFormatRangeProvider',
+          'vscode.executeFormatDocumentProvider',
           virtualDoc.uri,
-          virtualRange,
           options
         );
 
+        // Apply edits to get formatted text
+        let formatted = trimmed;
         if (edits && edits.length > 0) {
-          const mappedEdits = edits.map(edit => {
-            const origStartOffset = region.contentStart + virtualDoc!.offsetAt(edit.range.start);
-            const origEndOffset = region.contentStart + virtualDoc!.offsetAt(edit.range.end);
-            const origRange = new vscode.Range(
-              document.positionAt(origStartOffset),
-              document.positionAt(origEndOffset)
-            );
-            return new vscode.TextEdit(origRange, edit.newText);
-          });
-          allEdits.push(...mappedEdits);
+          formatted = this.applyEditsToString(trimmed, edits, virtualDoc);
+        }
+
+        // Only template gets one level of indentation; script/style stay flush
+        const needIndent = region.tagName === 'template';
+        const indented = formatted
+          .split(/\r?\n/)
+          .map(line => (needIndent && line.length > 0) ? indent + line : line)
+          .join(eol);
+        const replacement = eol + indented + eol;
+
+        if (replacement !== regionContent) {
+          const origRange = new vscode.Range(
+            document.positionAt(region.contentStart),
+            document.positionAt(region.contentEnd)
+          );
+          allEdits.push(new vscode.TextEdit(origRange, replacement));
         }
       } catch {
         // Continue to the next region if one fails
@@ -225,7 +229,7 @@ export class VueRangeFormattingProvider implements vscode.DocumentRangeFormattin
 
       const langId = this.detectLangId(tagName, attrs);
 
-      regions.push({ langId, contentStart, contentEnd });
+      regions.push({ tagName, langId, contentStart, contentEnd });
     }
 
     return regions;
@@ -275,5 +279,28 @@ export class VueRangeFormattingProvider implements vscode.DocumentRangeFormattin
       'pug': '.pug',
     };
     return map[langId] || '.txt';
+  }
+
+  /**
+   * Apply TextEdits to a string, returning the resulting string.
+   */
+  private applyEditsToString(
+    source: string,
+    edits: vscode.TextEdit[],
+    doc: vscode.TextDocument
+  ): string {
+    // Sort edits in reverse order so earlier offsets remain valid
+    const sorted = [...edits].sort((a, b) => {
+      const ao = doc.offsetAt(a.range.start);
+      const bo = doc.offsetAt(b.range.start);
+      return bo - ao;
+    });
+    let result = source;
+    for (const edit of sorted) {
+      const start = doc.offsetAt(edit.range.start);
+      const end = doc.offsetAt(edit.range.end);
+      result = result.substring(0, start) + edit.newText + result.substring(end);
+    }
+    return result;
   }
 }
