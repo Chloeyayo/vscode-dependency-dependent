@@ -99,11 +99,26 @@ export class DependencyGraph {
    * Shows progress in the VS Code window.
    */
   async initialize(entryPatterns: string[], excludes: string[]): Promise<void> {
+    if (this.initialized) {
+      return;
+    }
+
     if (this.initPromise) {
       return this.initPromise;
     }
 
-    this.initPromise = this._doInitialize(entryPatterns, excludes);
+    this.initPromise = (async () => {
+      try {
+        await this._doInitialize(entryPatterns, excludes);
+        this.initialized = true;
+      } catch (e) {
+        this.initialized = false;
+        throw e;
+      } finally {
+        this.initPromise = null;
+      }
+    })();
+
     return this.initPromise;
   }
 
@@ -145,8 +160,6 @@ export class DependencyGraph {
     log.appendLine(
       `DependencyGraph: Initialization complete. ${this.dependencyMap.size} nodes in graph.`
     );
-    this.initialized = true;
-    this.initPromise = null;
   }
 
   /**
@@ -166,9 +179,6 @@ export class DependencyGraph {
       return;
     }
 
-    // Remove old edges from this file
-    this.removeFileEdges(normalizedPath);
-
     // Extract import sources
     let importSources: string[];
     try {
@@ -179,17 +189,21 @@ export class DependencyGraph {
       return;
     }
 
-    // Resolve each import to an absolute path
+    // Resolve all imports in parallel (enhanced-resolve supports concurrent resolution)
     const resolvedDeps = new Set<string>();
-    for (const source of importSources) {
-      const resolved = await this.resolvePath(
-        path.dirname(filePath),
-        source
-      );
+    const resolutions = await Promise.all(
+      importSources.map((source) =>
+        this.resolvePath(path.dirname(filePath), source)
+      )
+    );
+    for (const resolved of resolutions) {
       if (resolved) {
         resolvedDeps.add(resolved);
       }
     }
+
+    // Parse/resolve completed successfully; now atomically replace old edges
+    this.removeFileEdges(normalizedPath);
 
     // Update dependency map
     this.dependencyMap.set(normalizedPath, resolvedDeps);

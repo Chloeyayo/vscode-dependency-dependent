@@ -1,5 +1,7 @@
 import * as vscode from "vscode";
+import * as path from "path";
 import { glob } from "glob";
+import { Minimatch } from "minimatch";
 import { DepMap } from ".";
 import { DependencyGraph } from "./core/DependencyGraph";
 import { log } from "./extension";
@@ -20,6 +22,10 @@ export class DepService {
 
   /** FileSystemWatcher subscription */
   private watcher: vscode.FileSystemWatcher | undefined;
+  private workspaceMatchers = new Map<string, {
+    includes: Minimatch[];
+    excludes: Minimatch[];
+  }>();
 
   constructor() {}
 
@@ -32,6 +38,7 @@ export class DepService {
       this.watcher.dispose();
       this.watcher = undefined;
     }
+    this.workspaceMatchers.clear();
     singletonInstance = undefined!;
   }
 
@@ -142,9 +149,13 @@ export class DepService {
       if (!graph || !graph.isInitialized()) {
         return;
       }
+      const normalizedPath = vscode.Uri.file(uri.fsPath).fsPath;
+      if (!this.shouldProcessFile(fsPath, normalizedPath, graph, true)) {
+        return;
+      }
 
-      log.appendLine(`Incremental update: ${uri.fsPath}`);
-      await graph.processFile(uri.fsPath);
+      log.appendLine(`Incremental update: ${normalizedPath}`);
+      await graph.processFile(normalizedPath);
     };
 
     const handleFileDelete = (uri: vscode.Uri) => {
@@ -158,9 +169,13 @@ export class DepService {
       if (!graph || !graph.isInitialized()) {
         return;
       }
+      const normalizedPath = vscode.Uri.file(uri.fsPath).fsPath;
+      if (!this.shouldProcessFile(fsPath, normalizedPath, graph, false)) {
+        return;
+      }
 
-      log.appendLine(`File deleted, removing from graph: ${uri.fsPath}`);
-      graph.removeFile(vscode.Uri.file(uri.fsPath).fsPath);
+      log.appendLine(`File deleted, removing from graph: ${normalizedPath}`);
+      graph.removeFile(normalizedPath);
     };
 
     this.watcher.onDidChange(handleFileChange);
@@ -194,14 +209,75 @@ export class DepService {
       this.graphs.set(fsPath, graph);
     }
 
-    const config = vscode.workspace.getConfiguration("dependencyDependent");
-    const entryConfig = config.get<string[]>("entryPoints") || [];
-    const excludesConfig = config.get<string[]>("excludes") || [];
+    const entryConfig = vscode.workspace
+      .getConfiguration("dependencyDependent", workspace.uri)
+      .get<string[]>("entryPoints") || [];
+    const excludesConfig = vscode.workspace
+      .getConfiguration("dependencyDependent")
+      .get<string[]>("excludes") || [];
+    this.workspaceMatchers.set(
+      fsPath,
+      this.buildWorkspaceMatchers(entryConfig, excludesConfig)
+    );
 
     log.appendLine(`Initializing DependencyGraph for workspace: ${fsPath}`);
     await graph.initialize(entryConfig, excludesConfig);
 
     return graph;
+  }
+
+  private buildWorkspaceMatchers(entryConfig: string[], excludesConfig: string[]) {
+    const normalizedEntries = entryConfig.length
+      ? entryConfig.map((pattern) => pattern.replace(/\\/g, "/"))
+      : ["**/*.{js,ts,jsx,tsx,vue}"];
+    const normalizedExcludes = excludesConfig.map((pattern) =>
+      `**/${pattern.replace(/\\/g, "/")}/**`
+    );
+    const matcherOptions = { dot: true, nocase: process.platform === "win32" };
+
+    return {
+      includes: normalizedEntries.map(
+        (pattern) => new Minimatch(pattern, matcherOptions)
+      ),
+      excludes: normalizedExcludes.map(
+        (pattern) => new Minimatch(pattern, matcherOptions)
+      ),
+    };
+  }
+
+  private shouldProcessFile(
+    workspacePath: string,
+    filePath: string,
+    graph: DependencyGraph,
+    allowEntryMatch: boolean
+  ): boolean {
+    if (graph.getDependencyMap().has(filePath) || graph.getDependentMap().has(filePath)) {
+      return true;
+    }
+
+    if (!allowEntryMatch) {
+      return false;
+    }
+
+    const matchers = this.workspaceMatchers.get(workspacePath);
+    if (!matchers) {
+      return false;
+    }
+
+    const relativePath = path.relative(workspacePath, filePath).replace(/\\/g, "/");
+    if (
+      relativePath.startsWith("..") ||
+      path.isAbsolute(relativePath) ||
+      relativePath.length === 0
+    ) {
+      return false;
+    }
+
+    if (matchers.excludes.some((matcher) => matcher.match(relativePath))) {
+      return false;
+    }
+
+    return matchers.includes.some((matcher) => matcher.match(relativePath));
   }
 
   // ─── Static Helpers (kept for WebpackDefinitionProvider compatibility) ─
@@ -220,7 +296,10 @@ export class DepService {
       return [];
     }
 
-    const config = vscode.workspace.getConfiguration("dependencyDependent");
+    const config = vscode.workspace.getConfiguration(
+      "dependencyDependent",
+      workspace?.uri
+    );
     const entryConfig = config.get<string[]>("entryPoints") || [];
 
     const globPromises = entryConfig.map((entry) =>

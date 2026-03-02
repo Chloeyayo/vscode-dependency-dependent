@@ -102,36 +102,48 @@ export class VueTimelineProvider implements vscode.TreeDataProvider<AnyTreeItem>
     private trackingResult: VariableTrackingResult | null = null;
     private trackingVariableName: string = '';
     public treeView: vscode.TreeView<AnyTreeItem> | undefined;
+    private disposables: vscode.Disposable[] = [];
 
     constructor() {
         this.analyzer = new VueTimelineAnalyzer();
 
         // Listen to active editor changes
-        vscode.window.onDidChangeActiveTextEditor(editor => {
-            if (this.trackingMode) return; // Don't refresh in tracking mode
-            if (editor && editor.document.languageId === 'vue') {
-                this.refresh(editor.document);
-            } else {
-                this.clear();
-            }
-        });
+        this.disposables.push(
+            vscode.window.onDidChangeActiveTextEditor(editor => {
+                if (this.trackingMode) return; // Don't refresh in tracking mode
+                if (editor && editor.document.languageId === 'vue') {
+                    this.refresh(editor.document);
+                } else {
+                    this.clear();
+                }
+            })
+        );
 
         // Listen to document saves
-        vscode.workspace.onDidSaveTextDocument(document => {
-            if (document.languageId === 'vue' && vscode.window.activeTextEditor?.document === document) {
-                if (this.trackingMode) {
-                    // Re-run tracking on save
-                    this.enterTrackingMode(this.trackingVariableName, document);
-                } else {
-                    this.refresh(document);
+        this.disposables.push(
+            vscode.workspace.onDidSaveTextDocument(document => {
+                if (document.languageId === 'vue' && vscode.window.activeTextEditor?.document === document) {
+                    if (this.trackingMode) {
+                        // Re-run tracking on save
+                        this.enterTrackingMode(this.trackingVariableName, document);
+                    } else {
+                        this.refresh(document);
+                    }
                 }
-            }
-        });
+            })
+        );
 
         // Initial load
         if (vscode.window.activeTextEditor && vscode.window.activeTextEditor.document.languageId === 'vue') {
             this.refresh(vscode.window.activeTextEditor.document);
         }
+    }
+
+    public dispose(): void {
+        for (const d of this.disposables) {
+            d.dispose();
+        }
+        this.disposables = [];
     }
 
     public async refresh(document?: vscode.TextDocument): Promise<void> {

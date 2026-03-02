@@ -28,6 +28,15 @@ const BS_CLOSE_OPEN: Record<string, string> = { '}': '{', ']': '[', ')': '(' };
 // Block select: open→close bracket lookup
 const BS_OPEN_CLOSE: Record<string, string> = { '{': '}', '[': ']', '(': ')' };
 
+/** Check if char at `pos` is escaped by counting preceding backslashes */
+function isEscapedAt(text: string, pos: number): boolean {
+  let backslashes = 0;
+  for (let i = pos - 1; i >= 0 && text[i] === '\\'; i--) {
+    backslashes++;
+  }
+  return backslashes % 2 === 1;
+}
+
 // Stored for deactivate() to cancel
 let _debouncedRefresh: ReturnType<typeof debounce> | undefined;
 
@@ -36,7 +45,10 @@ export function activate(context: vscode.ExtensionContext) {
   setContext(context);
 
   // Initialize TreeSitterParser with correct extension path
-  const wasmPath = path.join(context.extensionPath, 'src', 'grammars');
+  // Try src/grammars first (dev mode), fall back to grammars/ (packaged extension)
+  const srcGrammars = path.join(context.extensionPath, 'src', 'grammars');
+  const rootGrammars = path.join(context.extensionPath, 'grammars');
+  const wasmPath = require('fs').existsSync(srcGrammars) ? srcGrammars : rootGrammars;
   const tsParser = TreeSitterParser.getInstance(wasmPath);
   // Pre-initialize wasm to avoid first-parse delay
   tsParser.init().catch(e => log.appendLine(`TreeSitter pre-init failed: ${e.message}`));
@@ -48,6 +60,7 @@ export function activate(context: vscode.ExtensionContext) {
   });
   vueTimelineProvider.treeView = vueTimelineView;
   context.subscriptions.push(vueTimelineView);
+  context.subscriptions.push(vueTimelineProvider); // dispose event listeners
   
   // Set up file system watcher for incremental dependency graph updates
   DepService.singleton.setupFileWatcher(context);
@@ -92,11 +105,44 @@ export function activate(context: vscode.ExtensionContext) {
   // Invalidate $xxx cache when root package.json changes (plugin deps may have changed)
   // Use single-level glob to avoid firing on every node_modules/**/ package.json
   const invalidateDebounced = debounce(() => vueCompletionProvider.invalidatePrototypeCache(), 1000);
-  const pkgWatcher = vscode.workspace.createFileSystemWatcher('*/package.json', false, false, false);
-  pkgWatcher.onDidChange(() => invalidateDebounced());
-  pkgWatcher.onDidCreate(() => invalidateDebounced());
-  pkgWatcher.onDidDelete(() => invalidateDebounced());
-  context.subscriptions.push(pkgWatcher);
+  const pkgWatchers = new Map<string, vscode.FileSystemWatcher>();
+  const registerPkgWatcher = (workspace: vscode.WorkspaceFolder) => {
+    const key = workspace.uri.toString();
+    if (pkgWatchers.has(key)) {
+      return;
+    }
+
+    const watcher = vscode.workspace.createFileSystemWatcher(
+      new vscode.RelativePattern(workspace, "package.json"),
+      false,
+      false,
+      false
+    );
+    watcher.onDidChange(() => invalidateDebounced());
+    watcher.onDidCreate(() => invalidateDebounced());
+    watcher.onDidDelete(() => invalidateDebounced());
+    pkgWatchers.set(key, watcher);
+    context.subscriptions.push(watcher);
+  };
+
+  for (const workspace of vscode.workspace.workspaceFolders || []) {
+    registerPkgWatcher(workspace);
+  }
+  context.subscriptions.push(
+    vscode.workspace.onDidChangeWorkspaceFolders((event) => {
+      for (const removed of event.removed) {
+        const key = removed.uri.toString();
+        const watcher = pkgWatchers.get(key);
+        if (watcher) {
+          watcher.dispose();
+          pkgWatchers.delete(key);
+        }
+      }
+      for (const added of event.added) {
+        registerPkgWatcher(added);
+      }
+    })
+  );
 
   // Register Completion Provider for Vue Template (Mustache, @event, :bind)
   const vueTemplateCompletionProvider = new VueTemplateCompletionProvider();
@@ -117,6 +163,7 @@ export function activate(context: vscode.ExtensionContext) {
   // Auto-import component (< trigger in template)
   const vueTagProvider = new VueComponentTagCompletionProvider();
   context.subscriptions.push(
+    vueTagProvider,
     vscode.languages.registerCompletionItemProvider(vueSelector, vueTagProvider, '<')
   );
 
@@ -223,7 +270,7 @@ export function activate(context: vscode.ExtensionContext) {
         if (state === 'str') {
           // Cursor is inside (or on the opening quote of) the string
           oPos = strOpen; qChar = strChar;
-        } else if (lastStrOpen !== -1 && L < len && text[L] === lastStrChar && (L === 0 || text[L - 1] !== '\\')) {
+        } else if (lastStrOpen !== -1 && L < len && text[L] === lastStrChar && !isEscapedAt(text, L)) {
           // Cursor is ON the closing quote of the most recently closed string
           oPos = lastStrOpen; cPos = L; qChar = lastStrChar;
         }
@@ -232,7 +279,7 @@ export function activate(context: vscode.ExtensionContext) {
           if (cPos === -1) {
             // Find closing quote from oPos+1 (j ≥ 1, so text[j-1] is always in-bounds)
             for (let j = oPos + 1; j < len; j++) {
-              if (text[j] === qChar && text[j - 1] !== '\\') { cPos = j; break; }
+              if (text[j] === qChar && !isEscapedAt(text, j)) { cPos = j; break; }
             }
           }
           if (cPos !== -1 && cPos >= R) { qStart = oPos; qEnd = cPos + 1; }
@@ -268,22 +315,38 @@ export function activate(context: vscode.ExtensionContext) {
     })
   );
 
-  const config = vscode.workspace.getConfiguration("dependencyDependent");
-  const debounceDelay = config.get<number>("debounceDelay") || 0;
+  let currentDebounceDelay = vscode.workspace
+    .getConfiguration("dependencyDependent")
+    .get<number>("debounceDelay") || 0;
 
   // Debounced refresh to prevent rapid updates when switching tabs quickly
-  const debouncedRefresh = debounce(() => {
+  const makeRefresh = (delay: number) => debounce(() => {
     const locked = getLocked();
     if (locked === true) {
       return;
     }
-
     DepExplorerView.singleton.refresh();
-  }, debounceDelay);
+  }, delay);
+
+  let debouncedRefresh = makeRefresh(currentDebounceDelay);
   _debouncedRefresh = debouncedRefresh;
 
+  // Recreate debounced refresh when debounceDelay config changes
   context.subscriptions.push(
-    vscode.window.onDidChangeActiveTextEditor(debouncedRefresh)
+    vscode.workspace.onDidChangeConfiguration(e => {
+      if (e.affectsConfiguration("dependencyDependent.debounceDelay")) {
+        _debouncedRefresh?.cancel();
+        currentDebounceDelay = vscode.workspace
+          .getConfiguration("dependencyDependent")
+          .get<number>("debounceDelay") || 0;
+        debouncedRefresh = makeRefresh(currentDebounceDelay);
+        _debouncedRefresh = debouncedRefresh;
+      }
+    })
+  );
+
+  context.subscriptions.push(
+    vscode.window.onDidChangeActiveTextEditor(() => debouncedRefresh())
   );
 
   context.subscriptions.push(

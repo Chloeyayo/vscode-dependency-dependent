@@ -1,5 +1,6 @@
 import * as vscode from "vscode";
 import { TreeSitterParser } from "../core/TreeSitterParser";
+import { getRootTemplateBounds } from "../core/vueTemplateUtils";
 
 /**
  * Vue Template Completion Provider
@@ -18,6 +19,14 @@ export class VueTemplateCompletionProvider implements vscode.CompletionItemProvi
     properties: { name: string; source: string }[];
   } | null = null;
 
+  private snapshotCache: {
+    uri: string;
+    version: number;
+    text: string;
+    templateStart: number;
+    templateEnd: number;
+  } | null = null;
+
   constructor() {
     this.treeSitterParser = TreeSitterParser.getInstance();
   }
@@ -30,17 +39,22 @@ export class VueTemplateCompletionProvider implements vscode.CompletionItemProvi
   ): Promise<vscode.CompletionList | null> {
     if (!document.fileName.endsWith('.vue')) return null;
 
+    const snapshot = this.getDocumentSnapshot(document);
+    const offset = document.offsetAt(position);
+
     // Ensure cursor is inside <template> block (not in <script> or <style>)
-    if (!this.isInsideTemplate(document, position)) return null;
+    if (!this.isInsideTemplate(offset, snapshot.templateStart, snapshot.templateEnd)) {
+      return null;
+    }
 
     if (_token.isCancellationRequested) return null;
 
     // Determine which template context we're in
-    const ctx = this.detectContext(document, position);
+    const ctx = this.detectContext(document, position, snapshot.text, offset);
     if (!ctx) return null;
 
     // Get all component properties (with caching)
-    const properties = await this.getProperties(document);
+    const properties = await this.getProperties(document, snapshot.text);
     if (!properties.length) return null;
 
     // Filter properties based on context
@@ -63,26 +77,36 @@ export class VueTemplateCompletionProvider implements vscode.CompletionItemProvi
     return new vscode.CompletionList(items, false);
   }
 
-  /**
-   * Check if the cursor position is inside the <template> block.
-   */
-  private isInsideTemplate(document: vscode.TextDocument, position: vscode.Position): boolean {
+  private getDocumentSnapshot(document: vscode.TextDocument): {
+    text: string;
+    templateStart: number;
+    templateEnd: number;
+  } {
+    const uri = document.uri.toString();
+    if (
+      this.snapshotCache &&
+      this.snapshotCache.uri === uri &&
+      this.snapshotCache.version === document.version
+    ) {
+      return this.snapshotCache;
+    }
+
     const text = document.getText();
-    const offset = document.offsetAt(position);
+    const bounds = getRootTemplateBounds(text);
+    const snapshot = {
+      text,
+      templateStart: bounds ? bounds.openTagEnd : -1,
+      templateEnd: bounds ? bounds.closeTagStart : -1,
+    };
+    this.snapshotCache = { uri, version: document.version, ...snapshot };
+    return snapshot;
+  }
 
-    // Find root-level <template> and </template>
-    const templateStart = text.match(/^<template[\s>]/m);
-    if (!templateStart || templateStart.index === undefined) return false;
-
-    // Find the end of the opening <template> tag
-    const openTagEnd = text.indexOf('>', templateStart.index);
-    if (openTagEnd === -1 || offset <= openTagEnd) return false;
-
-    // Find root-level </template>
-    const templateEndMatch = text.match(/^<\/template\s*>/m);
-    if (!templateEndMatch || templateEndMatch.index === undefined) return false;
-
-    return offset > openTagEnd && offset < templateEndMatch.index;
+  private isInsideTemplate(offset: number, templateStart: number, templateEnd: number): boolean {
+    if (templateStart < 0 || templateEnd < 0) {
+      return false;
+    }
+    return offset > templateStart && offset < templateEnd;
   }
 
   /**
@@ -100,13 +124,15 @@ export class VueTemplateCompletionProvider implements vscode.CompletionItemProvi
    */
   private detectContext(
     document: vscode.TextDocument,
-    position: vscode.Position
+    position: vscode.Position,
+    text: string,
+    offset: number
   ): { type: 'mustache' | 'event' | 'bind' } | null {
     const lineText = document.lineAt(position.line).text;
     const textBeforeCursor = lineText.substring(0, position.character);
 
     // 1. Mustache interpolation: cursor is after {{ and no closing }}
-    if (this.isInsideMustache(document, position)) {
+    if (this.isInsideMustache(text, offset)) {
       return { type: 'mustache' };
     }
 
@@ -131,10 +157,7 @@ export class VueTemplateCompletionProvider implements vscode.CompletionItemProvi
    * Check if cursor is inside a Mustache interpolation {{ }}.
    * Scans backwards from cursor to find an unclosed {{.
    */
-  private isInsideMustache(document: vscode.TextDocument, position: vscode.Position): boolean {
-    const text = document.getText();
-    const offset = document.offsetAt(position);
-
+  private isInsideMustache(text: string, offset: number): boolean {
     // Scan backwards from cursor looking for {{ or }}
     let depth = 0;
     for (let i = offset - 1; i >= 1; i--) {
@@ -154,7 +177,8 @@ export class VueTemplateCompletionProvider implements vscode.CompletionItemProvi
    * Get component properties with document-version caching.
    */
   private async getProperties(
-    document: vscode.TextDocument
+    document: vscode.TextDocument,
+    content: string
   ): Promise<{ name: string; source: string }[]> {
     const uri = document.uri.toString();
     const version = document.version;
@@ -163,9 +187,7 @@ export class VueTemplateCompletionProvider implements vscode.CompletionItemProvi
       return this.cache.properties;
     }
 
-    const content = document.getText();
     const properties = await this.treeSitterParser.collectVueOptionProperties(content);
-
     this.cache = { uri, version, properties };
     return properties;
   }

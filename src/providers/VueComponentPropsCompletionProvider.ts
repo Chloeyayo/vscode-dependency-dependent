@@ -5,26 +5,8 @@ import { ResolverFactory, CachedInputFileSystem } from "enhanced-resolve";
 import { DepService } from "../DepService";
 import { TreeSitterParser } from "../core/TreeSitterParser";
 import { log } from "../extension";
-
-// Common HTML native elements to exclude from component prop completion
-const NATIVE_HTML_TAGS = new Set([
-    'div', 'span', 'p', 'a', 'button', 'input', 'form', 'table', 'tr', 'td', 'th',
-    'ul', 'ol', 'li', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'img', 'video', 'audio',
-    'select', 'option', 'optgroup', 'label', 'header', 'footer', 'main', 'section',
-    'article', 'nav', 'aside', 'figure', 'figcaption', 'template', 'slot', 'style',
-    'script', 'canvas', 'iframe', 'textarea', 'pre', 'code', 'hr', 'br', 'strong',
-    'em', 'b', 'i', 'u', 's', 'small', 'big', 'sub', 'sup', 'blockquote', 'q',
-    'cite', 'abbr', 'acronym', 'address', 'map', 'area', 'object', 'param', 'embed',
-    'fieldset', 'legend', 'caption', 'col', 'colgroup', 'thead', 'tbody', 'tfoot',
-    'dd', 'dl', 'dt', 'menu', 'menuitem', 'summary', 'details', 'dialog', 'data',
-    'datalist', 'output', 'progress', 'meter', 'time', 'mark', 'ruby', 'rt', 'rp',
-    'bdi', 'bdo', 'wbr', 'picture', 'source', 'track', 'noscript', 'html', 'head',
-    'body', 'base', 'link', 'meta', 'title', 'keygen', 'del', 'ins', 'svg', 'path',
-    'g', 'circle', 'rect', 'line', 'polygon', 'polyline', 'ellipse', 'text', 'use',
-    'defs', 'symbol', 'mask', 'clippath', 'filter', 'image', 'pattern', 'radialGradient',
-    'linearGradient', 'stop', 'animate', 'animateTransform', 'animateMotion', 'set',
-    'transition', 'keep-alive', 'component', 'router-view', 'router-link',
-]);
+import { isOffsetInsideRootTemplate } from "../core/vueTemplateUtils";
+import { NATIVE_HTML_TAGS } from "../core/htmlTags";
 
 /** djb2 hash for caching */
 function hashContent(content: string): number {
@@ -201,7 +183,7 @@ export class VueComponentPropsCompletionProvider implements vscode.CompletionIte
     private async getComponentProps(absPath: string, token: vscode.CancellationToken): Promise<string[]> {
         let fileContent: string;
         try {
-            fileContent = fs.readFileSync(absPath, 'utf-8');
+            fileContent = await fs.promises.readFile(absPath, 'utf-8');
         } catch {
             return [];
         }
@@ -228,19 +210,7 @@ export class VueComponentPropsCompletionProvider implements vscode.CompletionIte
     }
 
     private isInsideTemplate(document: vscode.TextDocument, position: vscode.Position): boolean {
-        const text = document.getText();
-        const offset = document.offsetAt(position);
-
-        const templateStart = text.match(/^<template[\s>]/m);
-        if (!templateStart || templateStart.index === undefined) return false;
-
-        const openTagEnd = text.indexOf('>', templateStart.index);
-        if (openTagEnd === -1 || offset <= openTagEnd) return false;
-
-        const templateEndMatch = text.match(/^<\/template\s*>/m);
-        if (!templateEndMatch || templateEndMatch.index === undefined) return false;
-
-        return offset > openTagEnd && offset < templateEndMatch.index;
+        return isOffsetInsideRootTemplate(document.getText(), document.offsetAt(position));
     }
 
     private async initResolver(workspace: vscode.WorkspaceFolder) {

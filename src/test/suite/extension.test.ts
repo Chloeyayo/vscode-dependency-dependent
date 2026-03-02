@@ -13,27 +13,21 @@ suite("Extension", () => {
 
   teardown(async () => {});
 
-  test("All package.json commands should be registered in extension", (done) => {
+  test("All package.json commands should be registered in extension", async () => {
     if (!extension) {
       throw Error("can't find extension");
     }
+    await extension.activate();
 
     const packageCommands = extension.packageJSON.contributes.commands.map(
       (c: any) => c.command
     );
 
-    // get all extension commands excluding internal commands.
-    vscode.commands.getCommands(true).then((allCommands) => {
-      const activeCommands = allCommands.filter((c) =>
-        c.startsWith(`${extensionShortName}.`)
-      );
-
-      activeCommands.forEach((command) => {
-        const result = packageCommands.some((c: any) => c === command);
-        assert.ok(result);
-      });
-
-      done();
+    // package.json 中声明的命令都必须注册成功
+    const allCommands = await vscode.commands.getCommands(true);
+    packageCommands.forEach((command: string) => {
+      const result = allCommands.some((c) => c === command);
+      assert.ok(result, `Command is not registered: ${command}`);
     });
   });
 });

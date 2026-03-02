@@ -4,6 +4,81 @@ import * as fs from 'fs';
 import { log } from '../extension';
 import { context } from '../share';
 
+let ParserModule: any = require('web-tree-sitter');
+if (
+    typeof ParserModule?.init !== 'function' &&
+    typeof ParserModule?.Parser?.init !== 'function'
+) {
+    try {
+        const parserModulePath = require.resolve('web-tree-sitter');
+        delete require.cache[parserModulePath];
+        ParserModule = require('web-tree-sitter');
+    } catch {
+        // Ignore cache reset failures; we'll validate runtime API later.
+    }
+}
+
+function collectParserCandidates(root: any): any[] {
+    const result: any[] = [];
+    const queue: any[] = [root];
+    const seen = new Set<any>();
+
+    while (queue.length > 0) {
+        const current = queue.shift();
+        if (!current || seen.has(current)) {
+            continue;
+        }
+        seen.add(current);
+        result.push(current);
+
+        if ((typeof current === 'object' || typeof current === 'function')) {
+            if (current.default) queue.push(current.default);
+            if (current.Parser) queue.push(current.Parser);
+        }
+    }
+
+    return result;
+}
+
+// Resolve init() eagerly — it's available before init is called
+const parserCandidates = collectParserCandidates(ParserModule);
+const parserInitOwner = parserCandidates.find(
+    (candidate) => typeof candidate?.init === 'function'
+);
+const ParserRuntimeInit: any =
+    typeof parserInitOwner?.init === 'function'
+        ? parserInitOwner.init.bind(parserInitOwner)
+        : undefined;
+
+// web-tree-sitter 0.22.x only populates Language and prototype.setLanguage
+// AFTER init() is called, so these must be resolved lazily.
+let _cachedCtor: any = null;
+let _cachedLanguage: any = null;
+
+function getParserRuntimeCtor(): any {
+    if (_cachedCtor) return _cachedCtor;
+    const candidates = collectParserCandidates(ParserModule);
+    _cachedCtor =
+        candidates.find((c) =>
+            typeof c === 'function' &&
+            typeof c.prototype?.setLanguage === 'function'
+        ) ||
+        candidates.find((c) => typeof c === 'function');
+    return _cachedCtor;
+}
+
+function getParserRuntimeLanguage(): any {
+    if (_cachedLanguage) return _cachedLanguage;
+    const ctor = getParserRuntimeCtor();
+    const candidates = collectParserCandidates(ParserModule);
+    _cachedLanguage =
+        ctor?.Language ||
+        candidates
+            .map((c) => c?.Language)
+            .find((lang) => typeof lang?.load === 'function');
+    return _cachedLanguage;
+}
+
 // Map of language ID to WASM file name
 const LANG_WASM_MAP: Record<string, string> = {
     'javascript': 'tree-sitter-javascript.wasm',
@@ -12,7 +87,8 @@ const LANG_WASM_MAP: Record<string, string> = {
 };
 
 // Regex to extract <script> or <script lang="ts"/"tsx"> content from Vue SFC
-const VUE_SCRIPT_RE = /<script(?:\s+[^>]*)?>([^]*?)<\/script>/i;
+// Global flag to find ALL script blocks; we then prefer the non-setup one.
+const VUE_SCRIPT_RE = /<script(\b[^>]*)?>([^]*?)<\/script>/gi;
 
 export class TreeSitterParser {
     private static instance: TreeSitterParser;
@@ -21,27 +97,114 @@ export class TreeSitterParser {
     private importQueries: Map<string, Parser.Query> = new Map();
     private identifierImportQuery: Map<string, Parser.Query> = new Map();
     private parserLoading: Map<string, Promise<Parser | undefined>> = new Map();
-    private treeCache: Map<string, { hash: number; tree: any }> = new Map();
+    /** LRU tree cache keyed by content hash — avoids thrashing when parsing multiple files */
+    private treeCache: Map<number, { langId: string; tree: any }> = new Map();
+    private static readonly TREE_CACHE_MAX = 10;
     private wasmDir: string;
     private initialized = false;
+    private missingLanguageLog = new Set<string>();
 
     private constructor(wasmDir: string) {
         this.wasmDir = wasmDir;
     }
 
-    public static getInstance(contextOrPath?: string): TreeSitterParser {
-        if (!TreeSitterParser.instance) {
-             // Use extension context path if available, otherwise fall back to provided path
-             let wasmPath = contextOrPath;
-             if (!wasmPath && context?.extensionPath) {
-                 wasmPath = path.join(context.extensionPath, 'src', 'grammars');
-             }
-             if (!wasmPath) {
-                 // Last resort fallback (may not work in bundled extension)
-                 wasmPath = path.join(__dirname, '../grammars');
-             }
-             TreeSitterParser.instance = new TreeSitterParser(wasmPath);
+    private static pushUnique(candidates: string[], candidate?: string): void {
+        if (!candidate) return;
+        const normalized = path.resolve(candidate);
+        if (!candidates.includes(normalized)) {
+            candidates.push(normalized);
         }
+    }
+
+    private static buildWasmDirCandidates(preferredPath?: string): string[] {
+        const candidates: string[] = [];
+
+        TreeSitterParser.pushUnique(candidates, preferredPath);
+
+        if (context?.extensionPath) {
+            TreeSitterParser.pushUnique(candidates, path.join(context.extensionPath, 'src', 'grammars'));
+            TreeSitterParser.pushUnique(candidates, path.join(context.extensionPath, 'grammars'));
+        }
+
+        TreeSitterParser.pushUnique(candidates, path.join(process.cwd(), 'src', 'grammars'));
+        TreeSitterParser.pushUnique(candidates, path.join(process.cwd(), 'grammars'));
+        TreeSitterParser.pushUnique(candidates, path.resolve(__dirname, '../grammars'));
+        TreeSitterParser.pushUnique(candidates, path.resolve(__dirname, '../../src/grammars'));
+
+        return candidates;
+    }
+
+    private static isValidWasmDir(dir: string): boolean {
+        return fs.existsSync(path.join(dir, 'tree-sitter-javascript.wasm')) &&
+               fs.existsSync(path.join(dir, 'tree-sitter-typescript.wasm'));
+    }
+
+    private static resolveWasmDir(preferredPath?: string): string | undefined {
+        const candidates = TreeSitterParser.buildWasmDirCandidates(preferredPath);
+        for (const candidate of candidates) {
+            if (TreeSitterParser.isValidWasmDir(candidate)) {
+                return candidate;
+            }
+        }
+        return undefined;
+    }
+
+    private refreshWasmDir(preferredPath?: string): void {
+        const resolved = TreeSitterParser.resolveWasmDir(preferredPath);
+        if (resolved && resolved !== this.wasmDir) {
+            this.wasmDir = resolved;
+            log.appendLine(`TreeSitter wasmDir switched to: ${this.wasmDir}`);
+        }
+    }
+
+    private resolveCoreWasmPath(): string | null {
+        const candidates: string[] = [];
+
+        TreeSitterParser.pushUnique(
+            candidates,
+            path.join(this.wasmDir, '..', '..', 'node_modules', 'web-tree-sitter', 'tree-sitter.wasm')
+        );
+        TreeSitterParser.pushUnique(
+            candidates,
+            path.join(this.wasmDir, '..', 'node_modules', 'web-tree-sitter', 'tree-sitter.wasm')
+        );
+        if (context?.extensionPath) {
+            TreeSitterParser.pushUnique(
+                candidates,
+                path.join(context.extensionPath, 'node_modules', 'web-tree-sitter', 'tree-sitter.wasm')
+            );
+        }
+        TreeSitterParser.pushUnique(
+            candidates,
+            path.join(process.cwd(), 'node_modules', 'web-tree-sitter', 'tree-sitter.wasm')
+        );
+
+        for (const candidate of candidates) {
+            if (fs.existsSync(candidate)) {
+                return candidate;
+            }
+        }
+
+        return null;
+    }
+
+    public static getInstance(contextOrPath?: string): TreeSitterParser {
+        const resolvedPath = TreeSitterParser.resolveWasmDir(contextOrPath);
+
+        if (!TreeSitterParser.instance) {
+            const fallbackPath =
+                resolvedPath ||
+                contextOrPath ||
+                path.join(process.cwd(), 'src', 'grammars');
+            TreeSitterParser.instance = new TreeSitterParser(fallbackPath);
+        }
+
+        if (resolvedPath) {
+            TreeSitterParser.instance.refreshWasmDir(resolvedPath);
+        } else {
+            TreeSitterParser.instance.refreshWasmDir();
+        }
+
         return TreeSitterParser.instance;
     }
 
@@ -59,20 +222,38 @@ export class TreeSitterParser {
         TreeSitterParser.instance = undefined!;
     }
 
+    /** Evict oldest cache entries when cache exceeds max size */
+    private evictTreeCache(): void {
+        while (this.treeCache.size > TreeSitterParser.TREE_CACHE_MAX) {
+            const oldest = this.treeCache.keys().next().value;
+            if (oldest === undefined) break;
+            const entry = this.treeCache.get(oldest);
+            entry?.tree?.delete?.();
+            this.treeCache.delete(oldest);
+        }
+    }
+
     public async init(): Promise<void> {
         if (this.initialized) return;
 
         try {
-            const treeSitterWasmPath = path.join(this.wasmDir, '..', '..', 'node_modules', 'web-tree-sitter', 'tree-sitter.wasm');
+            this.refreshWasmDir(this.wasmDir);
+            const treeSitterWasmPath = this.resolveCoreWasmPath();
+            if (!treeSitterWasmPath) {
+                throw new Error(
+                    `Cannot locate web-tree-sitter core wasm. wasmDir=${this.wasmDir}`
+                );
+            }
             log.appendLine(`TreeSitter wasmDir: ${this.wasmDir}`);
             log.appendLine(`TreeSitter wasm path: ${treeSitterWasmPath}`);
-            log.appendLine(`TreeSitter wasm exists: ${fs.existsSync(treeSitterWasmPath)}`);
 
             log.appendLine('Step 1: About to call Parser.init()');
             try {
-                await Parser.init({
+                if (typeof ParserRuntimeInit !== 'function') {
+                    throw new Error('web-tree-sitter init API not found');
+                }
+                await ParserRuntimeInit({
                     locateFile(scriptName: string) {
-                        log.appendLine(`locateFile called with: ${scriptName}`);
                         return treeSitterWasmPath;
                     }
                 } as any);
@@ -118,28 +299,48 @@ export class TreeSitterParser {
             return undefined;
         }
 
-        const wasmPath = path.join(this.wasmDir, wasmFile);
-        if (!fs.existsSync(wasmPath)) {
-            log.appendLine(`WASM file not found: ${wasmPath}`);
-            return undefined;
+        this.refreshWasmDir(this.wasmDir);
+        const tried: string[] = [];
+
+        for (const candidateDir of TreeSitterParser.buildWasmDirCandidates(this.wasmDir)) {
+            const wasmPath = path.join(candidateDir, wasmFile);
+            tried.push(wasmPath);
+            if (!fs.existsSync(wasmPath)) {
+                continue;
+            }
+
+            try {
+                const Ctor = getParserRuntimeCtor();
+                const Lang = getParserRuntimeLanguage();
+                if (typeof Ctor !== 'function' || !Lang?.load) {
+                    throw new Error('web-tree-sitter parser ctor or language API not found');
+                }
+                log.appendLine(`Loading language WASM: ${wasmPath}`);
+                const wasmBinary = await fs.promises.readFile(wasmPath);
+                const lang = await Lang.load(new Uint8Array(wasmBinary));
+                const parser = new Ctor();
+                parser.setLanguage(lang);
+
+                this.languages.set(langId, lang);
+                this.parsers.set(langId, parser);
+                this.wasmDir = candidateDir;
+                this.missingLanguageLog.delete(langId);
+                log.appendLine(`Language loaded for ${langId}`);
+
+                return parser;
+            } catch (e: any) {
+                log.appendLine(`Failed to load parser for ${langId} from ${wasmPath}: ${e.message || e}`);
+            }
         }
 
-        try {
-            log.appendLine(`Loading language WASM: ${wasmPath}`);
-            const wasmBinary = await fs.promises.readFile(wasmPath);
-            const lang = await Parser.Language.load(new Uint8Array(wasmBinary));
-            const parser = new Parser();
-            parser.setLanguage(lang);
-
-            this.languages.set(langId, lang);
-            this.parsers.set(langId, parser);
-            log.appendLine(`Language loaded for ${langId}`);
-
-            return parser;
-        } catch (e: any) {
-            log.appendLine(`Failed to load parser for ${langId}: ${e.message || e}`);
-            return undefined;
+        if (!this.missingLanguageLog.has(langId)) {
+            this.missingLanguageLog.add(langId);
+            log.appendLine(
+                `Failed to locate/load language wasm for ${langId}. Tried: ${tried.join(' | ')}`
+            );
         }
+
+        return undefined;
     }
 
     public getLanguage(langId: string): Parser.Language | undefined {
@@ -147,30 +348,28 @@ export class TreeSitterParser {
     }
 
     /**
-     * Parse content with a per-language last-tree cache.
-     * If the same content (by hash) was parsed before for this language,
-     * the cached tree is returned immediately (zero cost).
-     * Old trees are automatically deleted when replaced.
+     * Parse content with a content-hash-keyed LRU cache.
+     * If the same content was parsed before, the cached tree is returned
+     * immediately (zero cost). Old entries are evicted when cache is full.
      */
     private async parseWithCache(langId: string, content: string): Promise<any | null> {
         const parser = await this.getParser(langId);
         if (!parser) return null;
 
         const hash = this.hashContent(content);
-        const cached = this.treeCache.get(langId);
+        const cached = this.treeCache.get(hash);
 
-        if (cached && cached.hash === hash) {
+        if (cached && cached.langId === langId) {
+            // Move to end (most recently used) by re-inserting
+            this.treeCache.delete(hash);
+            this.treeCache.set(hash, cached);
             return cached.tree;
-        }
-
-        // Delete old cached tree to free WASM memory
-        if (cached) {
-            cached.tree.delete();
         }
 
         const tree = parser.parse(content);
         if (tree) {
-            this.treeCache.set(langId, { hash, tree });
+            this.treeCache.set(hash, { langId, tree });
+            this.evictTreeCache();
         }
         return tree;
     }
@@ -211,17 +410,38 @@ export class TreeSitterParser {
         return undefined;
     }
 
+    /**
+     * Find the best <script> block from a Vue SFC.
+     * Prefers the non-setup script block (Options API) over <script setup>.
+     */
+    private findBestScriptMatch(content: string): { attrs: string; body: string; index: number; fullMatch: string } | null {
+        VUE_SCRIPT_RE.lastIndex = 0;
+        let match: RegExpExecArray | null;
+        let bestMatch: { attrs: string; body: string; index: number; fullMatch: string } | null = null;
+
+        while ((match = VUE_SCRIPT_RE.exec(content)) !== null) {
+            const attrs = match[1] || '';
+            const body = match[2];
+            const isSetup = /\bsetup\b/.test(attrs);
+            if (!bestMatch || !isSetup) {
+                bestMatch = { attrs, body, index: match.index, fullMatch: match[0] };
+                if (!isSetup) break; // Prefer non-setup, stop searching
+            }
+        }
+        return bestMatch;
+    }
+
     private extractVueScript(content: string): string | null {
-        const match = VUE_SCRIPT_RE.exec(content);
-        return match ? match[1] : null;
+        const match = this.findBestScriptMatch(content);
+        return match ? match.body : null;
     }
 
     public extractVueScriptInfo(content: string): { scriptContent: string; scriptOffset: number } | null {
-        const match = VUE_SCRIPT_RE.exec(content);
+        const match = this.findBestScriptMatch(content);
         if (!match) return null;
         return {
-            scriptContent: match[1],
-            scriptOffset: match.index + match[0].indexOf(match[1]),
+            scriptContent: match.body,
+            scriptOffset: match.index + match.fullMatch.indexOf(match.body),
         };
     }
 
@@ -899,7 +1119,7 @@ export class TreeSitterParser {
         // Specifically, if an action modifies the same property as another action, we keep the first one
         // and optionally change it to show it happens conditionally.
         const filteredActions: any[] = [];
-        const seenProperties = new Set<string>();
+        const seenProperties = new Map<string, any>(); // key → action (for O(1) lookup)
 
         for (const action of actions) {
             // For assignments, we can extract the left side before '=' 
@@ -907,11 +1127,11 @@ export class TreeSitterParser {
             const match = action.type === 'assignment' ? action.label.split(' =')[0] : action.label;
             
             if (!seenProperties.has(match)) {
-                seenProperties.add(match);
+                seenProperties.set(match, action);
                 filteredActions.push(action);
             } else {
                 // We've seen this before, let's update the existing one to indicate multiple branches
-                const existing = filteredActions.find(a => (a.type === 'assignment' ? a.label.split(' =')[0] : a.label) === match);
+                const existing = seenProperties.get(match);
                 if (existing && !existing.label.includes(' (conditional)')) {
                     if (existing.type === 'assignment') {
                         existing.label = `${match} = ... (conditional)`;

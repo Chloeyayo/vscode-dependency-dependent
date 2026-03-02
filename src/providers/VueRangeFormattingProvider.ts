@@ -209,20 +209,28 @@ export class VueRangeFormattingProvider implements vscode.DocumentRangeFormattin
 
   /**
    * Parse the Vue SFC file to find template, script, and style regions.
+   * Only matches root-level blocks (no leading whitespace before the opening tag).
    */
   private parseRegions(text: string): SFCRegion[] {
     const regions: SFCRegion[] = [];
 
-    const blockPattern = /<(template|script|style)(\b[^>]*)>/gi;
+    // Only match tags at column 0 (root-level SFC blocks, not nested <template v-if>)
+    const blockPattern = /^<(template|script|style)(\b[^>]*)>/gim;
     let match: RegExpExecArray | null;
 
     while ((match = blockPattern.exec(text)) !== null) {
+      // Verify tag is truly at column 0 (no leading whitespace on its line)
+      if (match.index > 0 && text[match.index - 1] !== '\n' && text[match.index - 1] !== '\r') {
+        continue;
+      }
+
       const tagName = match[1].toLowerCase();
       const attrs = match[2] || '';
       const contentStart = match.index + match[0].length;
 
-      const closingTag = new RegExp(`</${tagName}\\s*>`, 'i');
-      const closeMatch = closingTag.exec(text.substring(contentStart));
+      // Find the matching root-level closing tag (at column 0)
+      const closingRe = new RegExp(`^</${tagName}\\s*>`, 'im');
+      const closeMatch = closingRe.exec(text.substring(contentStart));
       if (!closeMatch) continue;
 
       const contentEnd = contentStart + closeMatch.index;
