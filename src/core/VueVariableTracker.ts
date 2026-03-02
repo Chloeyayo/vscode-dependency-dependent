@@ -1,5 +1,6 @@
 import * as vscode from 'vscode';
 import { TreeSitterParser } from './TreeSitterParser';
+import { log } from '../log';
 
 // --- Types ---
 
@@ -54,11 +55,14 @@ export class VueVariableTracker {
     public async trackVariable(content: string, variableName: string, uri: vscode.Uri): Promise<VariableTrackingResult> {
         const scriptInfo = this.treeSitterParser.extractVueScriptInfo(content);
         if (!scriptInfo) {
+            log.appendLine(`[Timeline] trackVariable: No <script> block found`);
             return { targetVariable: variableName, dataInit: null, paths: [], uri };
         }
 
         const { scriptContent, scriptOffset } = scriptInfo;
+        log.appendLine(`[Timeline] trackVariable: building call graph for "${variableName}"...`);
         const callGraph = await this.treeSitterParser.buildComponentCallGraph(scriptContent);
+        log.appendLine(`[Timeline] trackVariable: callGraph has ${callGraph.methods.size} methods, ${callGraph.dataInitialValues.size} data values`);
 
         // Get data init value (adjusted for script offset)
         let dataInit: VariableTrackingResult['dataInit'] = null;
