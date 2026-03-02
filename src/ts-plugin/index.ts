@@ -39,16 +39,22 @@ function init(modules: { typescript: typeof import("typescript/lib/tsserverlibra
      *
      * Returns `{ content, scriptKind }`.
      */
-    function extractScript(text: string): { content: string; scriptKind: ts.ScriptKind } {
+    interface ExtractedScript {
+      content: string;
+      scriptKind: ts.ScriptKind;
+      scriptStart: number;
+      scriptEnd: number;
+    }
+
+    function extractScript(text: string): ExtractedScript {
       // Match <script ...> with optional lang attribute
       const scriptOpenRe = /<script(\s[^>]*)?\s*>/i;
       const scriptCloseRe = /<\/script\s*>/i;
 
       const openMatch = scriptOpenRe.exec(text);
-      logger.info(`[vue-ts-plugin] extractScript: text length=${text.length}, openMatch=${openMatch ? `index=${openMatch.index}, match="${openMatch[0]}"` : 'null'}`);
       if (!openMatch) {
         // No <script> block — return all spaces (preserving newlines)
-        return { content: padAll(text), scriptKind: ts.ScriptKind.JS };
+        return { content: padAll(text), scriptKind: ts.ScriptKind.JS, scriptStart: 0, scriptEnd: 0 };
       }
 
       const attrs = openMatch[1] || "";
@@ -62,7 +68,7 @@ function init(modules: { typescript: typeof import("typescript/lib/tsserverlibra
         // Unclosed <script> — treat rest of file as script body
         const before = padAll(text.slice(0, scriptBodyStart));
         const body = text.slice(scriptBodyStart);
-        return { content: before + body, scriptKind };
+        return { content: before + body, scriptKind, scriptStart: scriptBodyStart, scriptEnd: text.length };
       }
 
       const scriptBodyEnd = scriptBodyStart + closeMatch.index;
@@ -71,40 +77,49 @@ function init(modules: { typescript: typeof import("typescript/lib/tsserverlibra
       const body = text.slice(scriptBodyStart, scriptBodyEnd);
       const after = padAll(text.slice(scriptBodyEnd));
 
-      return { content: before + body + after, scriptKind };
+      return { content: before + body + after, scriptKind, scriptStart: scriptBodyStart, scriptEnd: scriptBodyEnd };
     }
 
     /** Replace all characters with spaces, preserving `\n` for line structure. */
     function padAll(s: string): string {
-      let out = "";
-      for (let i = 0; i < s.length; i++) {
-        out += s[i] === "\n" ? "\n" : " ";
-      }
-      return out;
+      return s.replace(/[^\n]/g, " ");
     }
 
     // Cache extracted results per-file to avoid re-parsing on every call
-    const scriptCache = new Map<string, {
-      version: string;
-      content: string;
-      scriptKind: ts.ScriptKind;
-    }>();
+    const SCRIPT_CACHE_MAX = 200;
+    const scriptCache = new Map<string, ExtractedScript & { version: string }>();
 
-    function getExtracted(fileName: string): { content: string; scriptKind: ts.ScriptKind } {
+    function setScriptCache(fileName: string, value: ExtractedScript & { version: string }): void {
+      if (scriptCache.has(fileName)) {
+        scriptCache.delete(fileName);
+      }
+      scriptCache.set(fileName, value);
+
+      while (scriptCache.size > SCRIPT_CACHE_MAX) {
+        const oldest = scriptCache.keys().next().value;
+        if (oldest === undefined) break;
+        scriptCache.delete(oldest);
+      }
+    }
+
+    function getExtracted(fileName: string): ExtractedScript {
       const version = host.getScriptVersion(fileName);
       const cached = scriptCache.get(fileName);
       if (cached && cached.version === version) {
-        return { content: cached.content, scriptKind: cached.scriptKind };
+        // refresh recency on hit
+        scriptCache.delete(fileName);
+        scriptCache.set(fileName, cached);
+        return cached;
       }
 
       // Read via original snapshot (before our interception)
       const snap = origGetScriptSnapshot(fileName);
       if (!snap) {
-        return { content: "", scriptKind: ts.ScriptKind.JS };
+        return { content: "", scriptKind: ts.ScriptKind.JS, scriptStart: 0, scriptEnd: 0 };
       }
       const text = snap.getText(0, snap.getLength());
       const result = extractScript(text);
-      scriptCache.set(fileName, { version, ...result });
+      setScriptCache(fileName, { version, ...result });
       return result;
     }
 
@@ -128,7 +143,6 @@ function init(modules: { typescript: typeof import("typescript/lib/tsserverlibra
     host.getScriptSnapshot = (fileName: string) => {
       if (isVueFile(fileName)) {
         const { content } = getExtracted(fileName);
-        logger.info(`[vue-ts-plugin] getScriptSnapshot for ${fileName}, content length=${content.length}, first 100 chars: ${JSON.stringify(content.slice(0, 100))}`);
         return ts.ScriptSnapshot.fromString(content);
       }
       return origGetScriptSnapshot(fileName);
@@ -157,26 +171,25 @@ function init(modules: { typescript: typeof import("typescript/lib/tsserverlibra
       options: ts.GetCompletionsAtPositionOptions | undefined,
     ) => {
       if (isVueFile(fileName)) {
-        const { content } = getExtracted(fileName);
+        const { content, scriptStart, scriptEnd } = getExtracted(fileName);
 
         // Check if position is inside the script body (non-space region)
         if (position >= content.length || content[position - 1] === undefined) {
           return undefined;
         }
 
-        // Look backwards for `this.` or `this.$` pattern
-        const lookback = content.slice(Math.max(0, position - 6), position);
-        if (/this\.\$?$/.test(lookback)) {
-          // Let the extension-side VueOptionsCompletionProvider handle it
+        // No script block or cursor outside script body
+        if (scriptStart === 0 && scriptEnd === 0) {
+          return undefined;
+        }
+        if (position < scriptStart || position > scriptEnd) {
           return undefined;
         }
 
-        // Check if cursor is in a padded (non-script) region
-        // Find the actual position in content — if it's a space-only line, skip
+        // Yield all this.xxx / this.$xxx / this.obj.xxx style completions
         const lineStart = content.lastIndexOf("\n", position - 1) + 1;
-        const lineEnd = content.indexOf("\n", position);
-        const line = content.slice(lineStart, lineEnd === -1 ? content.length : lineEnd);
-        if (line.trim().length === 0) {
+        const beforeCursor = content.slice(Math.max(lineStart, position - 256), position);
+        if (/\bthis\.([$\w]+(?:\.[$\w]+)*)\.([$\w]*)$/.test(beforeCursor) || /\bthis\.([$\w]*)$/.test(beforeCursor)) {
           return undefined;
         }
       }
@@ -190,15 +203,15 @@ function init(modules: { typescript: typeof import("typescript/lib/tsserverlibra
       diagnostics: ts.Diagnostic[]
     ): ts.Diagnostic[] => {
       if (!isVueFile(fileName)) return diagnostics;
-      const { content } = getExtracted(fileName);
+      const { scriptStart, scriptEnd } = getExtracted(fileName);
+
+      // No script block → drop all diagnostics
+      if (scriptStart === 0 && scriptEnd === 0) return [];
 
       return diagnostics.filter(d => {
         if (d.start === undefined) return true;
-        // Check that the diagnostic falls within actual script content (not padded spaces)
-        const lineStart = content.lastIndexOf("\n", d.start - 1) + 1;
-        const lineEnd = content.indexOf("\n", d.start);
-        const line = content.slice(lineStart, lineEnd === -1 ? content.length : lineEnd);
-        return line.trim().length > 0;
+        // O(1) range check: keep only diagnostics within the script body
+        return d.start >= scriptStart && d.start < scriptEnd;
       });
     };
 
