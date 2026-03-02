@@ -1,0 +1,6 @@
+{
+  "name": "dependency-dependent-ts-plugin",
+  "version": "0.0.0",
+  "private": true,
+  "main": "index.js"
+}

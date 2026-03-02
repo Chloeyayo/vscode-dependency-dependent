@@ -280,7 +280,7 @@
     ],
     "typescriptServerPlugins": [
       {
-        "name": "./dist/ts-plugin",
+        "name": "dependency-dependent-ts-plugin",
         "languages": [
           "vue"
         ],
@@ -315,6 +315,7 @@
     "typescript": "^5.4.5"
   },
   "dependencies": {
+    "dependency-dependent-ts-plugin": "file:./ts-plugin-bridge",
     "@types/enhanced-resolve": "^5.0.2",
     "enhanced-resolve": "^5.19.0",
     "web-tree-sitter": "0.22.6"
