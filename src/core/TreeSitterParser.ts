@@ -536,7 +536,7 @@ export class TreeSitterParser {
      */
     public async collectVueOptionProperties(
         content: string
-    ): Promise<{ name: string; source: 'data' | 'methods' | 'computed' | 'props' | 'watch' }[]> {
+    ): Promise<{ name: string; source: 'data' | 'methods' | 'computed' | 'props' | 'watch'; inferredType?: string }[]> {
         const scriptInfo = this.extractVueScriptInfo(content);
         if (!scriptInfo) return [];
 
@@ -554,9 +554,9 @@ export class TreeSitterParser {
      */
     private collectOptionPropertiesInTree(
         tree: any
-    ): { name: string; source: 'data' | 'methods' | 'computed' | 'props' | 'watch' }[] {
+    ): { name: string; source: 'data' | 'methods' | 'computed' | 'props' | 'watch'; inferredType?: string }[] {
         const root = tree.rootNode;
-        const results: { name: string; source: 'data' | 'methods' | 'computed' | 'props' | 'watch' }[] = [];
+        const results: { name: string; source: 'data' | 'methods' | 'computed' | 'props' | 'watch'; inferredType?: string }[] = [];
 
         const exportStmt = this.findNodeByType(root, 'export_statement');
         if (!exportStmt) return results;
@@ -614,18 +614,195 @@ export class TreeSitterParser {
     }
 
     /**
+     * Infer a type string from a tree-sitter AST value node.
+     */
+    private inferTypeFromNode(node: any, depth: number = 0): string {
+        if (!node) return 'any';
+        const type = node.type;
+
+        if (type === 'number') return 'number';
+        if (type === 'string' || type === 'template_string') return 'string';
+        if (type === 'true' || type === 'false') return 'boolean';
+        if (type === 'null') return 'null';
+        if (type === 'undefined') return 'undefined';
+        if (type === 'arrow_function' || type === 'function' || type === 'function_expression') return 'Function';
+
+        if (type === 'new_expression') {
+            const ctorNode = node.childForFieldName('constructor');
+            if (ctorNode) return ctorNode.text;
+            return 'object';
+        }
+
+        if (type === 'array') {
+            const elements = node.children.filter(
+                (c: any) => c.type !== ',' && c.type !== '[' && c.type !== ']'
+            );
+            if (elements.length === 0) return 'any[]';
+            if (depth >= 3) return 'any[]';
+            const elementTypes = new Set(
+                elements.map((e: any) => this.inferTypeFromNode(e, depth + 1))
+            );
+            if (elementTypes.size === 1) return `${[...elementTypes][0]}[]`;
+            return 'any[]';
+        }
+
+        if (type === 'object') {
+            if (depth >= 3) return 'object';
+            const pairs: string[] = [];
+            for (const child of node.children) {
+                if (child.type === 'pair') {
+                    const keyNode = child.childForFieldName('key');
+                    const valueNode = child.childForFieldName('value');
+                    if (keyNode) {
+                        const valType = this.inferTypeFromNode(valueNode, depth + 1);
+                        pairs.push(`${keyNode.text}: ${valType}`);
+                    }
+                } else if (child.type === 'shorthand_property_identifier') {
+                    pairs.push(`${child.text}: any`);
+                }
+            }
+            if (pairs.length === 0) return 'object';
+            return `{ ${pairs.join(', ')} }`;
+        }
+
+        // Parenthesized expression: unwrap
+        if (type === 'parenthesized_expression') {
+            const inner = node.children.find(
+                (c: any) => c.type !== '(' && c.type !== ')'
+            );
+            if (inner) return this.inferTypeFromNode(inner, depth);
+        }
+
+        return 'any';
+    }
+
+    /**
+     * Infer the return type from a computed property function body.
+     */
+    private inferComputedReturnType(node: any): string {
+        // method_definition: has 'body' field
+        const body = node.childForFieldName('body');
+        if (body) {
+            const returnStmt = this.findNodeByType(body, 'return_statement');
+            if (returnStmt) {
+                // The return value is the first non-keyword child
+                for (const child of returnStmt.children) {
+                    if (child.type !== 'return') {
+                        return this.inferTypeFromNode(child);
+                    }
+                }
+            }
+        }
+        // pair with function value
+        const value = node.childForFieldName('value');
+        if (value) {
+            const funcBody = value.childForFieldName('body');
+            if (funcBody) {
+                const returnStmt = this.findNodeByType(funcBody, 'return_statement');
+                if (returnStmt) {
+                    for (const child of returnStmt.children) {
+                        if (child.type !== 'return') {
+                            return this.inferTypeFromNode(child);
+                        }
+                    }
+                }
+            }
+            // Computed with get/set: look for get method
+            if (value.type === 'object') {
+                for (const child of value.children) {
+                    if (child.type === 'method_definition' || child.type === 'pair') {
+                        const keyNode = child.childForFieldName('key') || child.childForFieldName('name');
+                        if (keyNode && keyNode.text === 'get') {
+                            return this.inferComputedReturnType(child);
+                        }
+                    }
+                }
+            }
+        }
+        return 'any';
+    }
+
+    /**
+     * Infer type from a props definition with object syntax.
+     * e.g. { type: String } → 'string', { type: [String, Number] } → 'string | number'
+     */
+    private inferPropType(node: any): string {
+        // node is the value of a pair in props object
+        if (!node) return 'any';
+
+        // Direct constructor: props: { foo: String }
+        if (node.type === 'identifier') {
+            return this.constructorToType(node.text);
+        }
+
+        // Array shorthand: props: { foo: [String, Number] }
+        if (node.type === 'array') {
+            const types = node.children
+                .filter((c: any) => c.type === 'identifier')
+                .map((c: any) => this.constructorToType(c.text));
+            return types.length > 0 ? types.join(' | ') : 'any';
+        }
+
+        // Object syntax: props: { foo: { type: String, default: ... } }
+        if (node.type === 'object') {
+            for (const child of node.children) {
+                if (child.type === 'pair') {
+                    const keyNode = child.childForFieldName('key');
+                    if (keyNode && keyNode.text === 'type') {
+                        const valueNode = child.childForFieldName('value');
+                        if (valueNode) return this.inferPropType(valueNode);
+                    }
+                }
+            }
+        }
+
+        return 'any';
+    }
+
+    private constructorToType(name: string): string {
+        switch (name) {
+            case 'String': return 'string';
+            case 'Number': return 'number';
+            case 'Boolean': return 'boolean';
+            case 'Array': return 'any[]';
+            case 'Object': return 'object';
+            case 'Function': return 'Function';
+            case 'Date': return 'Date';
+            case 'Symbol': return 'symbol';
+            default: return name;
+        }
+    }
+
+    /**
      * Collect all property/method names from an object literal node.
      */
     private collectPropertyNames(
         objectNode: any,
         source: 'data' | 'methods' | 'computed' | 'props' | 'watch',
-        results: { name: string; source: typeof source }[]
+        results: { name: string; source: typeof source; inferredType?: string }[]
     ): void {
         for (const child of objectNode.children) {
             if (child.type === 'pair' || child.type === 'method_definition') {
                 const keyNode = child.childForFieldName('key') || child.childForFieldName('name');
                 if (keyNode) {
-                    results.push({ name: keyNode.text, source });
+                    let inferredType: string | undefined;
+                    if (source === 'data') {
+                        const valueNode = child.childForFieldName('value');
+                        if (valueNode) {
+                            inferredType = this.inferTypeFromNode(valueNode);
+                        }
+                    } else if (source === 'computed') {
+                        inferredType = this.inferComputedReturnType(child);
+                    } else if (source === 'props') {
+                        const valueNode = child.childForFieldName('value');
+                        if (valueNode) {
+                            inferredType = this.inferPropType(valueNode);
+                        }
+                    } else if (source === 'methods') {
+                        inferredType = 'Function';
+                    }
+                    if (inferredType === 'any') inferredType = undefined;
+                    results.push({ name: keyNode.text, source, inferredType });
                 }
             } else if (child.type === 'shorthand_property_identifier') {
                 results.push({ name: child.text, source });
@@ -640,7 +817,7 @@ export class TreeSitterParser {
     public async collectNestedProperties(
         content: string,
         chain: string[]
-    ): Promise<string[]> {
+    ): Promise<{ name: string; inferredType?: string }[]> {
         if (chain.length === 0) return [];
 
         const scriptInfo = this.extractVueScriptInfo(content);
@@ -689,16 +866,24 @@ export class TreeSitterParser {
 
         if (!targetNode || targetNode.type !== 'object') return [];
 
-        const names: string[] = [];
+        const props: { name: string; inferredType?: string }[] = [];
         for (const c of targetNode.children) {
             if (c.type === 'pair' || c.type === 'method_definition') {
                 const k = c.childForFieldName('key') || c.childForFieldName('name');
-                if (k) names.push(k.text);
+                if (k) {
+                    const valueNode = c.childForFieldName('value');
+                    let inferredType: string | undefined;
+                    if (valueNode) {
+                        inferredType = this.inferTypeFromNode(valueNode);
+                        if (inferredType === 'any') inferredType = undefined;
+                    }
+                    props.push({ name: k.text, inferredType });
+                }
             } else if (c.type === 'shorthand_property_identifier') {
-                names.push(c.text);
+                props.push({ name: c.text });
             }
         }
-        return names;
+        return props;
     }
 
     /**
