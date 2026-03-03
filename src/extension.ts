@@ -17,6 +17,7 @@ import { VueComponentTagCompletionProvider } from "./providers/VueComponentTagCo
 import { WebpackDefinitionProvider } from "./providers/WebpackDefinitionProvider";
 import { VueOptionsDefinitionProvider } from "./providers/VueOptionsDefinitionProvider";
 import { VueOptionsCompletionProvider } from "./providers/VueOptionsCompletionProvider";
+import { VueOptionsHoverProvider } from "./providers/VueOptionsHoverProvider";
 import { UILibraryDefinitionProvider } from "./providers/UILibraryDefinitionProvider";
 import { VuePrototypeScanner } from "./core/VuePrototypeScanner";
 import { VueTimelineProvider } from "./views/VueTimelineProvider";
@@ -101,6 +102,11 @@ export function activate(context: vscode.ExtensionContext) {
       vueCompletionProvider,
       '.', '$'  // trigger on dot and dollar sign
     )
+  );
+
+  // Register Hover Provider for Vue Options API (this.xxx type info)
+  context.subscriptions.push(
+    vscode.languages.registerHoverProvider(vueSelector, new VueOptionsHoverProvider())
   );
 
   // Invalidate $xxx cache when root package.json changes (plugin deps may have changed)

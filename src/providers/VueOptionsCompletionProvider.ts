@@ -55,11 +55,19 @@ export class VueOptionsCompletionProvider implements vscode.CompletionItemProvid
     // Check for nested property chain: this.obj.inner. or this.obj.
     const chainMatch = textBeforeCursor.match(/\bthis\.([$\w]+(?:\.[$\w]+)*)\.([$\w]*)$/);
     if (chainMatch) {
+      // For TS files, tsserver handles nested chains natively
+      if (/<script[^>]*\blang\s*=\s*["']?(ts|typescript)["']?/i.test(document.getText())) {
+        return null;
+      }
       return this.provideNestedCompletions(document, position, chainMatch);
     }
 
     const match = textBeforeCursor.match(/\bthis\.([$\w]*)$/);
     if (!match) return null;
+
+    // For <script lang="ts"> files, tsserver handles this.xxx natively via
+    // ThisType wrapping in the TS plugin. Only provide $xxx completions.
+    const isTS = /<script[^>]*\blang\s*=\s*["']?(ts|typescript)["']?/i.test(document.getText());
 
     // Calculate the range to replace: from right after "this." to current cursor
     const alreadyTyped = match[1]; // e.g. "f" in "this.f" or "$r" in "this.$r"
@@ -72,44 +80,47 @@ export class VueOptionsCompletionProvider implements vscode.CompletionItemProvid
     const items: vscode.CompletionItem[] = [];
 
     // ── Component properties (data / methods / computed / props / watch) ──
-    if (token.isCancellationRequested) return null;
-    let properties: { name: string; source: string; inferredType?: string }[];
-    const uri = document.uri.toString();
-    if (this.cache && this.cache.uri === uri && this.cache.version === document.version) {
-      properties = this.cache.properties;
-    } else {
-      const fileContent = document.getText();
-      try {
-        properties = await this.treeSitterParser.collectVueOptionProperties(fileContent);
-      } catch (e) {
-        console.error("VueOptionsCompletionProvider error:", e);
-        properties = [];
-      }
-      this.cache = { uri, version: document.version, properties };
-    }
-
-    for (const prop of properties) {
-      const isMethod = prop.source === 'methods';
-      const item = new vscode.CompletionItem(
-        prop.name,
-        this.getCompletionKind(prop.source)
-      );
-      item.detail = prop.inferredType
-        ? `(${prop.source}) ${prop.inferredType}`
-        : `(${prop.source})`;
-      item.documentation = new vscode.MarkdownString(
-        `Vue Options API — **${prop.source}** property`
-      );
-      item.sortText = `0_${this.getSourceOrder(prop.source)}_${prop.name}`;
-      item.filterText = prop.name;
-      item.range = replaceRange;
-
-      if (isMethod) {
-        const escaped = prop.name.replace(/\$/g, '\\$');
-        item.insertText = new vscode.SnippetString(`${escaped}($0)`);
+    // Skip for TS files — tsserver provides these with correct types
+    if (!isTS) {
+      if (token.isCancellationRequested) return null;
+      let properties: { name: string; source: string; inferredType?: string }[];
+      const uri = document.uri.toString();
+      if (this.cache && this.cache.uri === uri && this.cache.version === document.version) {
+        properties = this.cache.properties;
+      } else {
+        const fileContent = document.getText();
+        try {
+          properties = await this.treeSitterParser.collectVueOptionProperties(fileContent);
+        } catch (e) {
+          console.error("VueOptionsCompletionProvider error:", e);
+          properties = [];
+        }
+        this.cache = { uri, version: document.version, properties };
       }
 
-      items.push(item);
+      for (const prop of properties) {
+        const isMethod = prop.source === 'methods';
+        const item = new vscode.CompletionItem(
+          prop.name,
+          this.getCompletionKind(prop.source)
+        );
+        item.detail = prop.inferredType
+          ? `(${prop.source}) ${prop.inferredType}`
+          : `(${prop.source})`;
+        item.documentation = new vscode.MarkdownString(
+          `Vue Options API — **${prop.source}** property`
+        );
+        item.sortText = `0_${this.getSourceOrder(prop.source)}_${prop.name}`;
+        item.filterText = prop.name;
+        item.range = replaceRange;
+
+        if (isMethod) {
+          const escaped = prop.name.replace(/\$/g, '\\$');
+          item.insertText = new vscode.SnippetString(`${escaped}($0)`);
+        }
+
+        items.push(item);
+      }
     }
 
     // ── $xxx properties (builtins + plugins + entry files + config) ──
