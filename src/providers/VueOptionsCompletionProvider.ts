@@ -16,7 +16,7 @@ export class VueOptionsCompletionProvider implements vscode.CompletionItemProvid
   private cache: {
     uri: string;
     version: number;
-    properties: { name: string; source: string }[];
+    properties: { name: string; source: string; inferredType?: string }[];
   } | null = null;
 
   // Cache for nested property completions (keyed by uri + version + chain)
@@ -24,7 +24,7 @@ export class VueOptionsCompletionProvider implements vscode.CompletionItemProvid
     uri: string;
     version: number;
     chainKey: string;
-    names: string[];
+    properties: { name: string; inferredType?: string }[];
   } | null = null;
 
   constructor(prototypeScanner?: VuePrototypeScanner) {
@@ -73,7 +73,7 @@ export class VueOptionsCompletionProvider implements vscode.CompletionItemProvid
 
     // ── Component properties (data / methods / computed / props / watch) ──
     if (token.isCancellationRequested) return null;
-    let properties: { name: string; source: string }[];
+    let properties: { name: string; source: string; inferredType?: string }[];
     const uri = document.uri.toString();
     if (this.cache && this.cache.uri === uri && this.cache.version === document.version) {
       properties = this.cache.properties;
@@ -94,7 +94,9 @@ export class VueOptionsCompletionProvider implements vscode.CompletionItemProvid
         prop.name,
         this.getCompletionKind(prop.source)
       );
-      item.detail = `(${prop.source})`;
+      item.detail = prop.inferredType
+        ? `(${prop.source}) ${prop.inferredType}`
+        : `(${prop.source})`;
       item.documentation = new vscode.MarkdownString(
         `Vue Options API — **${prop.source}** property`
       );
@@ -154,26 +156,28 @@ export class VueOptionsCompletionProvider implements vscode.CompletionItemProvid
     try {
       const uri = document.uri.toString();
       const chainKey = chain.join('.');
-      let names: string[];
+      let nestedProps: { name: string; inferredType?: string }[];
 
       if (this.nestedCache && this.nestedCache.uri === uri
         && this.nestedCache.version === document.version
         && this.nestedCache.chainKey === chainKey) {
-        names = this.nestedCache.names;
+        nestedProps = this.nestedCache.properties;
       } else {
-        names = await this.treeSitterParser.collectNestedProperties(
+        nestedProps = await this.treeSitterParser.collectNestedProperties(
           document.getText(), chain
         );
-        this.nestedCache = { uri, version: document.version, chainKey, names };
+        this.nestedCache = { uri, version: document.version, chainKey, properties: nestedProps };
       }
 
-      if (names.length === 0) return null;
+      if (nestedProps.length === 0) return null;
 
-      const items = names.map(name => {
-        const item = new vscode.CompletionItem(name, vscode.CompletionItemKind.Field);
-        item.detail = `(${chain.join('.')})`;
-        item.sortText = `0_${name}`;
-        item.filterText = name;
+      const items = nestedProps.map(prop => {
+        const item = new vscode.CompletionItem(prop.name, vscode.CompletionItemKind.Field);
+        item.detail = prop.inferredType
+          ? `(${chain.join('.')}) ${prop.inferredType}`
+          : `(${chain.join('.')})`;
+        item.sortText = `0_${prop.name}`;
+        item.filterText = prop.name;
         item.range = replaceRange;
         return item;
       });
