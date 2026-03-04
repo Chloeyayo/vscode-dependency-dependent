@@ -19,6 +19,8 @@ function init(modules: { typescript: typeof import("typescript/lib/tsserverlibra
       objClosePos: number;
       prefixLen: number;
       suffixLen: number;
+      /** 修改后文件中 WRAP_FUNC_DECL 的起始偏移（用于过滤 decl 区域的 token） */
+      declStart: number;
     }
 
     interface ExtractedScript {
@@ -38,7 +40,6 @@ function init(modules: { typescript: typeof import("typescript/lib/tsserverlibra
       return fileName.endsWith(".vue");
     }
 
-    // ✅ FIX 1 — helper to detect node_modules paths
     function isNodeModulesFile(fileName: string): boolean {
       return /[/\\]node_modules[/\\]/.test(fileName);
     }
@@ -50,6 +51,18 @@ function init(modules: { typescript: typeof import("typescript/lib/tsserverlibra
     // ------------------------------------------------------------------ //
     // Position mapping                                                    //
     // ------------------------------------------------------------------ //
+    //
+    // 修改后文件结构（有 wrap 时）：
+    //
+    //  [0 .. objOpenPos-1]                    原样（template 等，padAll）
+    //  [objOpenPos .. objOpenPos+prefixLen-1]  WRAP_PREFIX  "__v("
+    //  [objOpenPos+prefixLen .. objClosePos+prefixLen]  原始对象体
+    //  [objClosePos+prefixLen+1 .. +suffixLen]          WRAP_SUFFIX  ")"
+    //  [objClosePos+prefixLen+suffixLen+1 .. declStart-1]  原始剩余（padAll）
+    //  [declStart ..]                         WRAP_FUNC_DECL（追加到最末尾）
+    //
+    // ⚠️  declStart 之后的位置完全超出 originalContent 范围，
+    //     toOriginal 对这部分直接夹到 origLen。
 
     function toModified(pos: number, w: WrapInfo): number {
       if (pos < w.objOpenPos) return pos;
@@ -57,7 +70,11 @@ function init(modules: { typescript: typeof import("typescript/lib/tsserverlibra
       return pos + w.prefixLen + w.suffixLen;
     }
 
-    function toOriginal(pos: number, w: WrapInfo): number {
+    /**
+     * @param origLen originalContent.length，用于夹住 decl 区域坐标
+     */
+    function toOriginal(pos: number, w: WrapInfo, origLen: number): number {
+      if (pos >= w.declStart) return origLen; // decl 区域 → 夹到末尾
       if (pos < w.objOpenPos) return pos;
       if (pos < w.objOpenPos + w.prefixLen) return w.objOpenPos;
       if (pos <= w.objClosePos + w.prefixLen) return pos - w.prefixLen;
@@ -65,9 +82,14 @@ function init(modules: { typescript: typeof import("typescript/lib/tsserverlibra
       return pos - w.prefixLen - w.suffixLen;
     }
 
-    function spanToOriginal(start: number, length: number, w: WrapInfo): { start: number; length: number } {
-      const origStart = toOriginal(start, w);
-      const origEnd = toOriginal(start + length, w);
+    function spanToOriginal(
+      start: number,
+      length: number,
+      w: WrapInfo,
+      origLen: number,
+    ): { start: number; length: number } {
+      const origStart = toOriginal(start, w, origLen);
+      const origEnd = toOriginal(start + length, w, origLen);
       return { start: origStart, length: Math.max(0, origEnd - origStart) };
     }
 
@@ -76,14 +98,15 @@ function init(modules: { typescript: typeof import("typescript/lib/tsserverlibra
     // ------------------------------------------------------------------ //
 
     const WRAP_FUNC_NAME = "__v";
-    // @ts-ignore
     const WRAP_FUNC_DECL = [
       "",
       "/**",
       " * @template D",
       " * @template M",
       " * @template C",
-      " * @param {{data?(): D, computed?: C, methods?: M, [k:string]: any} & ThisType<D & M & {[K in keyof C]: C[K] extends (...args: any[]) => infer R ? R : C[K]}>} o",
+      " * @param {{data?(): D, computed?: C, methods?: M, [k:string]: any}" +
+        " & ThisType<D & M & {[K in keyof C]: C[K] extends" +
+        " (...args: any[]) => infer R ? R : C[K]}>} o",
       " * @returns {typeof o}",
       " */",
       `function ${WRAP_FUNC_NAME}(o) { return o; }`,
@@ -102,7 +125,13 @@ function init(modules: { typescript: typeof import("typescript/lib/tsserverlibra
 
       let sf: ts.SourceFile;
       try {
-        sf = ts.createSourceFile("__vue__.js", scriptBody, ts.ScriptTarget.Latest, true, ts.ScriptKind.JS);
+        sf = ts.createSourceFile(
+          "__vue__.js",
+          scriptBody,
+          ts.ScriptTarget.Latest,
+          true,
+          ts.ScriptKind.JS,
+        );
       } catch {
         return null;
       }
@@ -111,7 +140,10 @@ function init(modules: { typescript: typeof import("typescript/lib/tsserverlibra
       let objEnd = -1;
       ts.forEachChild(sf, (node) => {
         if (objStart >= 0) return;
-        if (ts.isExportAssignment(node) && !(node as any).isExportEquals) {
+        if (
+          ts.isExportAssignment(node) &&
+          !(node as any).isExportEquals
+        ) {
           const expr = (node as ts.ExportAssignment).expression;
           if (ts.isObjectLiteralExpression(expr)) {
             objStart = expr.getStart(sf);
@@ -125,13 +157,19 @@ function init(modules: { typescript: typeof import("typescript/lib/tsserverlibra
       const objOpenPos = scriptStart + objStart;
       const objClosePos = scriptStart + objEnd - 1;
 
+      // ✅ 关键修复：DECL 追加到整个 paddedContent 末尾
+      //    paddedContent 在插入 prefix/suffix 后长度增加了
+      //    prefixLen + suffixLen，所以 declStart 是：
+      const declStart =
+        paddedContent.length + WRAP_PREFIX.length + WRAP_SUFFIX.length;
+
       const content =
         paddedContent.slice(0, objOpenPos) +
         WRAP_PREFIX +
         paddedContent.slice(objOpenPos, objClosePos + 1) +
         WRAP_SUFFIX +
-        paddedContent.slice(objClosePos + 1) +
-        WRAP_FUNC_DECL;
+        paddedContent.slice(objClosePos + 1) + // ← 原始剩余（padAll 区域）位置不变
+        WRAP_FUNC_DECL; //                        ← 追加到最末尾
 
       return {
         content,
@@ -140,6 +178,7 @@ function init(modules: { typescript: typeof import("typescript/lib/tsserverlibra
           objClosePos,
           prefixLen: WRAP_PREFIX.length,
           suffixLen: WRAP_SUFFIX.length,
+          declStart,
         },
       };
     }
@@ -155,7 +194,14 @@ function init(modules: { typescript: typeof import("typescript/lib/tsserverlibra
       const openMatch = scriptOpenRe.exec(text);
       if (!openMatch) {
         const c = padAll(text);
-        return { content: c, originalContent: c, scriptKind: ts.ScriptKind.JS, scriptStart: 0, scriptEnd: 0, wrapInfo: null };
+        return {
+          content: c,
+          originalContent: c,
+          scriptKind: ts.ScriptKind.JS,
+          scriptStart: 0,
+          scriptEnd: 0,
+          wrapInfo: null,
+        };
       }
 
       const scriptKind = ts.ScriptKind.JS;
@@ -181,24 +227,35 @@ function init(modules: { typescript: typeof import("typescript/lib/tsserverlibra
       let content = originalContent;
       let wrapInfo: WrapInfo | null = null;
 
-      const wrapped = tryWrapExportDefault(originalContent, scriptBodyStart, scriptBodyEnd);
+      const wrapped = tryWrapExportDefault(
+        originalContent,
+        scriptBodyStart,
+        scriptBodyEnd,
+      );
       if (wrapped) {
         content = wrapped.content;
         wrapInfo = wrapped.wrapInfo;
       }
 
-      return { content, originalContent, scriptKind, scriptStart: scriptBodyStart, scriptEnd: scriptBodyEnd, wrapInfo };
+      return {
+        content,
+        originalContent,
+        scriptKind,
+        scriptStart: scriptBodyStart,
+        scriptEnd: scriptBodyEnd,
+        wrapInfo,
+      };
     }
 
     const SCRIPT_CACHE_MAX = 200;
     const scriptCache = new Map<string, ExtractedScript & { version: string }>();
 
-    function setScriptCache(fileName: string, value: ExtractedScript & { version: string }): void {
-      if (scriptCache.has(fileName)) {
-        scriptCache.delete(fileName);
-      }
+    function setScriptCache(
+      fileName: string,
+      value: ExtractedScript & { version: string },
+    ): void {
+      scriptCache.delete(fileName);
       scriptCache.set(fileName, value);
-
       while (scriptCache.size > SCRIPT_CACHE_MAX) {
         const oldest = scriptCache.keys().next().value;
         if (oldest === undefined) break;
@@ -217,7 +274,14 @@ function init(modules: { typescript: typeof import("typescript/lib/tsserverlibra
 
       const snap = origGetScriptSnapshot(fileName);
       if (!snap) {
-        return { content: "", originalContent: "", scriptKind: ts.ScriptKind.JS, scriptStart: 0, scriptEnd: 0, wrapInfo: null };
+        return {
+          content: "",
+          originalContent: "",
+          scriptKind: ts.ScriptKind.JS,
+          scriptStart: 0,
+          scriptEnd: 0,
+          wrapInfo: null,
+        };
       }
       const text = snap.getText(0, snap.getLength());
       const result = extractScript(text);
@@ -232,9 +296,7 @@ function init(modules: { typescript: typeof import("typescript/lib/tsserverlibra
     const origGetScriptKind = host.getScriptKind?.bind(host);
     if (origGetScriptKind) {
       host.getScriptKind = (fileName: string) => {
-        if (isVueFile(fileName)) {
-          return ts.ScriptKind.JS;
-        }
+        if (isVueFile(fileName)) return ts.ScriptKind.JS;
         return origGetScriptKind(fileName);
       };
     }
@@ -248,40 +310,60 @@ function init(modules: { typescript: typeof import("typescript/lib/tsserverlibra
       return origGetScriptSnapshot(fileName);
     };
 
-    // ✅ FIX 2 — relax strict flags that produce cascading noise in JS
-    //
-    //  Problem:  the project (or TS defaults) may enable `strict`, which
-    //            activates noImplicitAny  → 7005/7006/7053 on every un-typed param
-    //            activates strictNullChecks → `[]` infers as `never[]`,
-    //                                        `null` infers as literal type `null`
-    //            These are unusable for Vue 2 Options-API JS components.
-    //
-    //  Fix:     explicitly disable the problematic sub-flags while keeping
-    //           noImplicitThis (required for ThisType<> to work) and adding
-    //           skipLibCheck to silence node_modules declaration-file errors.
     const origGetCompilationSettings = host.getCompilationSettings.bind(host);
     host.getCompilationSettings = () => {
       const s = origGetCompilationSettings();
+      // ✅ ...s 展开保留 paths / baseUrl / moduleResolution，
+      //    只叠加我们需要的标志。
       return {
         ...s,
         allowJs: true,
         checkJs: true,
-        // keep ThisType working
         noImplicitThis: true,
-        // ── relax the strict sub-flags ──
-        noImplicitAny: false,          // stops 7005 / 7006 / 7053
-        strictNullChecks: false,       // [] → any[] instead of never[]
-                                       // null assignable to any type
+        noImplicitAny: false,
+        strictNullChecks: false,
         strictFunctionTypes: false,
         strictPropertyInitialization: false,
-        // ── silence node_modules ──
         skipLibCheck: true,
         skipDefaultLibCheck: true,
       };
     };
 
+    // ✅ FIX 1：补全 resolveModuleNames
+    //
+    // tsserver 插件的 host 通常没有实现 resolveModuleNames，
+    // 导致 TypeScript 内部走"默认解析"，不认识 @/ 别名。
+    // 我们手动实现，用当前 compilerOptions（含 paths/baseUrl）调用
+    // ts.resolveModuleName，这样 @/ 就能正确解析。
+    if (!host.resolveModuleNames) {
+      host.resolveModuleNames = (
+        moduleNames: string[],
+        containingFile: string,
+        _reusedNames: string[] | undefined,
+        _redirectedReference: ts.ResolvedProjectReference | undefined,
+        compilerOptions: ts.CompilerOptions,
+      ): (ts.ResolvedModule | undefined)[] => {
+        return moduleNames.map((moduleName) => {
+          try {
+            const { resolvedModule } = ts.resolveModuleName(
+              moduleName,
+              containingFile,
+              compilerOptions,
+              host as ts.ModuleResolutionHost,
+            );
+            return resolvedModule;
+          } catch {
+            return undefined;
+          }
+        });
+      };
+    }
+
     const origGetScriptVersion = host.getScriptVersion.bind(host);
-    const vueContentVersions = new Map<string, { contentHash: string; version: number }>();
+    const vueContentVersions = new Map<
+      string,
+      { contentHash: string; version: number }
+    >();
 
     host.getScriptVersion = (fileName: string) => {
       if (isVueFile(fileName)) {
@@ -289,7 +371,8 @@ function init(modules: { typescript: typeof import("typescript/lib/tsserverlibra
         if (!snap) return origGetScriptVersion(fileName);
 
         const text = snap.getText(0, snap.getLength());
-        const contentHash = text.length + ":" + text.slice(0, 100) + text.slice(-100);
+        const contentHash =
+          text.length + ":" + text.slice(0, 100) + text.slice(-100);
 
         const prev = vueContentVersions.get(fileName);
         if (prev && prev.contentHash === contentHash) {
@@ -311,10 +394,33 @@ function init(modules: { typescript: typeof import("typescript/lib/tsserverlibra
     for (const k of Object.keys(ls) as Array<keyof ts.LanguageService>) {
       const val = ls[k];
       if (typeof val === "function") {
-        (proxy as any)[k] = val.bind(ls);
+        (proxy as any)[k] = (val as Function).bind(ls);
       } else {
         (proxy as any)[k] = val;
       }
+    }
+
+    // ------------------------------------------------------------------ //
+    // 统一反向映射工具                                                     //
+    // ------------------------------------------------------------------ //
+
+    function backSpan(
+      start: number,
+      length: number,
+      ext: ExtractedScript,
+    ): { start: number; length: number } {
+      if (!ext.wrapInfo) return { start, length };
+      return spanToOriginal(
+        start,
+        length,
+        ext.wrapInfo,
+        ext.originalContent.length,
+      );
+    }
+
+    function backPos(pos: number, ext: ExtractedScript): number {
+      if (!ext.wrapInfo) return pos;
+      return toOriginal(pos, ext.wrapInfo, ext.originalContent.length);
     }
 
     // -- Completions --------------------------------------------------
@@ -332,11 +438,11 @@ function init(modules: { typescript: typeof import("typescript/lib/tsserverlibra
         if (position < scriptStart || position > scriptEnd) return undefined;
 
         const lineStart = originalContent.lastIndexOf("\n", position - 1) + 1;
-        const beforeCursor = originalContent.slice(Math.max(lineStart, position - 256), position);
-
-        if (/\bthis\.\$[\w]*$/.test(beforeCursor)) {
-          return undefined;
-        }
+        const beforeCursor = originalContent.slice(
+          Math.max(lineStart, position - 256),
+          position,
+        );
+        if (/\bthis\.\$[\w]*$/.test(beforeCursor)) return undefined;
 
         const mapped = wrapInfo ? toModified(position, wrapInfo) : position;
         const result = ls.getCompletionsAtPosition(fileName, mapped, options);
@@ -344,10 +450,17 @@ function init(modules: { typescript: typeof import("typescript/lib/tsserverlibra
         if (result && wrapInfo) {
           return {
             ...result,
-            entries: result.entries.map(e => {
+            entries: result.entries.map((e) => {
               if (e.replacementSpan) {
-                const orig = spanToOriginal(e.replacementSpan.start, e.replacementSpan.length, wrapInfo);
-                return { ...e, replacementSpan: { start: orig.start, length: orig.length } };
+                const orig = backSpan(
+                  e.replacementSpan.start,
+                  e.replacementSpan.length,
+                  ext,
+                );
+                return {
+                  ...e,
+                  replacementSpan: { start: orig.start, length: orig.length },
+                };
               }
               return e;
             }),
@@ -370,19 +483,34 @@ function init(modules: { typescript: typeof import("typescript/lib/tsserverlibra
       data?: ts.CompletionEntryData,
     ) => {
       if (isVueFile(fileName)) {
-        const { wrapInfo } = getExtracted(fileName);
-        const mapped = wrapInfo ? toModified(position, wrapInfo) : position;
-        return ls.getCompletionEntryDetails(fileName, mapped, entryName, formatOptions, source, preferences, data);
+        const ext = getExtracted(fileName);
+        const mapped = ext.wrapInfo
+          ? toModified(position, ext.wrapInfo)
+          : position;
+        return ls.getCompletionEntryDetails(
+          fileName,
+          mapped,
+          entryName,
+          formatOptions,
+          source,
+          preferences,
+          data,
+        );
       }
-      return ls.getCompletionEntryDetails(fileName, position, entryName, formatOptions, source, preferences, data);
+      return ls.getCompletionEntryDetails(
+        fileName,
+        position,
+        entryName,
+        formatOptions,
+        source,
+        preferences,
+        data,
+      );
     };
 
     // -- Quick Info (hover) -------------------------------------------
 
-    proxy.getQuickInfoAtPosition = (
-      fileName: string,
-      position: number,
-    ) => {
+    proxy.getQuickInfoAtPosition = (fileName: string, position: number) => {
       if (isVueFile(fileName)) {
         const ext = getExtracted(fileName);
         const { scriptStart, scriptEnd, wrapInfo } = ext;
@@ -394,7 +522,11 @@ function init(modules: { typescript: typeof import("typescript/lib/tsserverlibra
         const result = ls.getQuickInfoAtPosition(fileName, mapped);
 
         if (result && wrapInfo) {
-          const orig = spanToOriginal(result.textSpan.start, result.textSpan.length, wrapInfo);
+          const orig = backSpan(
+            result.textSpan.start,
+            result.textSpan.length,
+            ext,
+          );
           return { ...result, textSpan: { start: orig.start, length: orig.length } };
         }
 
@@ -406,10 +538,7 @@ function init(modules: { typescript: typeof import("typescript/lib/tsserverlibra
 
     // -- Definitions --------------------------------------------------
 
-    proxy.getDefinitionAndBoundSpan = (
-      fileName: string,
-      position: number,
-    ) => {
+    proxy.getDefinitionAndBoundSpan = (fileName: string, position: number) => {
       if (isVueFile(fileName)) {
         const ext = getExtracted(fileName);
         const { wrapInfo } = ext;
@@ -418,22 +547,29 @@ function init(modules: { typescript: typeof import("typescript/lib/tsserverlibra
         const result = ls.getDefinitionAndBoundSpan(fileName, mapped);
 
         if (result && wrapInfo) {
-          const origTextSpan = spanToOriginal(result.textSpan.start, result.textSpan.length, wrapInfo);
-          const definitions = result.definitions?.map(d => {
+          const origTextSpan = backSpan(
+            result.textSpan.start,
+            result.textSpan.length,
+            ext,
+          );
+          const definitions = result.definitions?.map((d) => {
             if (d.fileName === fileName) {
-              const origSpan = spanToOriginal(d.textSpan.start, d.textSpan.length, wrapInfo);
-              return { ...d, textSpan: { start: origSpan.start, length: origSpan.length } };
+              const s = backSpan(d.textSpan.start, d.textSpan.length, ext);
+              return { ...d, textSpan: { start: s.start, length: s.length } };
             }
             if (isVueFile(d.fileName)) {
               const otherExt = getExtracted(d.fileName);
               if (otherExt.wrapInfo) {
-                const origSpan = spanToOriginal(d.textSpan.start, d.textSpan.length, otherExt.wrapInfo);
-                return { ...d, textSpan: { start: origSpan.start, length: origSpan.length } };
+                const s = backSpan(d.textSpan.start, d.textSpan.length, otherExt);
+                return { ...d, textSpan: { start: s.start, length: s.length } };
               }
             }
             return d;
           });
-          return { textSpan: { start: origTextSpan.start, length: origTextSpan.length }, definitions };
+          return {
+            textSpan: { start: origTextSpan.start, length: origTextSpan.length },
+            definitions,
+          };
         }
 
         return result;
@@ -443,8 +579,6 @@ function init(modules: { typescript: typeof import("typescript/lib/tsserverlibra
     };
 
     // -- Diagnostics --------------------------------------------------
-    // Suppress ALL diagnostics for Vue files (JS doesn't need TS checking)
-    // and for node_modules files (not actionable by the user).
 
     proxy.getSemanticDiagnostics = (fileName: string) => {
       if (isVueFile(fileName) || isNodeModulesFile(fileName)) return [];
@@ -461,8 +595,10 @@ function init(modules: { typescript: typeof import("typescript/lib/tsserverlibra
       return ls.getSuggestionDiagnostics(fileName);
     };
 
-    // -- Classifications (semantic highlighting) ----------------------
-    // Map token spans from wrapped coordinates back to original coordinates.
+    // -- Classifications (semantic / syntactic highlighting) ----------
+    //
+    // ✅ FIX 2：正确过滤 WRAP_FUNC_DECL 区域的 token，
+    //           并把其余 token 的坐标映射回原始文件。
 
     proxy.getEncodedSemanticClassifications = (
       fileName: string,
@@ -470,8 +606,10 @@ function init(modules: { typescript: typeof import("typescript/lib/tsserverlibra
       format?: ts.SemanticClassificationFormat,
     ) => {
       if (isVueFile(fileName)) {
-        const { wrapInfo } = getExtracted(fileName);
+        const ext = getExtracted(fileName);
+        const { wrapInfo, originalContent } = ext;
 
+        // 把请求 span 映射到修改后坐标
         let mappedSpan = span;
         if (wrapInfo) {
           const modStart = toModified(span.start, wrapInfo);
@@ -479,20 +617,31 @@ function init(modules: { typescript: typeof import("typescript/lib/tsserverlibra
           mappedSpan = { start: modStart, length: modEnd - modStart };
         }
 
-        const result = ls.getEncodedSemanticClassifications(fileName, mappedSpan, format);
+        const result = ls.getEncodedSemanticClassifications(
+          fileName,
+          mappedSpan,
+          format,
+        );
 
-        if (wrapInfo && result.spans.length > 0) {
-          const newSpans: number[] = [];
-          for (let i = 0; i < result.spans.length; i += 3) {
-            const orig = spanToOriginal(result.spans[i], result.spans[i + 1], wrapInfo);
-            if (orig.length > 0) {
-              newSpans.push(orig.start, orig.length, result.spans[i + 2]);
-            }
-          }
-          return { spans: newSpans, endOfLineState: result.endOfLineState };
+        if (!wrapInfo || result.spans.length === 0) return result;
+
+        const origLen = originalContent.length;
+        const newSpans: number[] = [];
+        for (let i = 0; i + 2 < result.spans.length; i += 3) {
+          const mStart = result.spans[i];
+          const mLen = result.spans[i + 1];
+          const kind = result.spans[i + 2];
+
+          // ✅ 跳过落在 WRAP_FUNC_DECL 区域的 token
+          if (mStart >= wrapInfo.declStart) continue;
+
+          const orig = spanToOriginal(mStart, mLen, wrapInfo, origLen);
+          if (orig.length <= 0) continue;
+
+          newSpans.push(orig.start, orig.length, kind);
         }
 
-        return result;
+        return { spans: newSpans, endOfLineState: result.endOfLineState };
       }
 
       return ls.getEncodedSemanticClassifications(fileName, span, format);
@@ -503,7 +652,8 @@ function init(modules: { typescript: typeof import("typescript/lib/tsserverlibra
       span: ts.TextSpan,
     ) => {
       if (isVueFile(fileName)) {
-        const { wrapInfo } = getExtracted(fileName);
+        const ext = getExtracted(fileName);
+        const { wrapInfo, originalContent } = ext;
 
         let mappedSpan = span;
         if (wrapInfo) {
@@ -512,20 +662,29 @@ function init(modules: { typescript: typeof import("typescript/lib/tsserverlibra
           mappedSpan = { start: modStart, length: modEnd - modStart };
         }
 
-        const result = ls.getEncodedSyntacticClassifications(fileName, mappedSpan);
+        const result = ls.getEncodedSyntacticClassifications(
+          fileName,
+          mappedSpan,
+        );
 
-        if (wrapInfo && result.spans.length > 0) {
-          const newSpans: number[] = [];
-          for (let i = 0; i < result.spans.length; i += 3) {
-            const orig = spanToOriginal(result.spans[i], result.spans[i + 1], wrapInfo);
-            if (orig.length > 0) {
-              newSpans.push(orig.start, orig.length, result.spans[i + 2]);
-            }
-          }
-          return { spans: newSpans, endOfLineState: result.endOfLineState };
+        if (!wrapInfo || result.spans.length === 0) return result;
+
+        const origLen = originalContent.length;
+        const newSpans: number[] = [];
+        for (let i = 0; i + 2 < result.spans.length; i += 3) {
+          const mStart = result.spans[i];
+          const mLen = result.spans[i + 1];
+          const kind = result.spans[i + 2];
+
+          if (mStart >= wrapInfo.declStart) continue;
+
+          const orig = spanToOriginal(mStart, mLen, wrapInfo, origLen);
+          if (orig.length <= 0) continue;
+
+          newSpans.push(orig.start, orig.length, kind);
         }
 
-        return result;
+        return { spans: newSpans, endOfLineState: result.endOfLineState };
       }
 
       return ls.getEncodedSyntacticClassifications(fileName, span);
@@ -539,8 +698,10 @@ function init(modules: { typescript: typeof import("typescript/lib/tsserverlibra
       options: ts.SignatureHelpItemsOptions | undefined,
     ) => {
       if (isVueFile(fileName)) {
-        const { wrapInfo } = getExtracted(fileName);
-        const mapped = wrapInfo ? toModified(position, wrapInfo) : position;
+        const ext = getExtracted(fileName);
+        const mapped = ext.wrapInfo
+          ? toModified(position, ext.wrapInfo)
+          : position;
         return ls.getSignatureHelpItems(fileName, mapped, options);
       }
       return ls.getSignatureHelpItems(fileName, position, options);
@@ -551,7 +712,7 @@ function init(modules: { typescript: typeof import("typescript/lib/tsserverlibra
   }
 
   function getExternalFiles(project: ts.server.Project): string[] {
-    return project.getFileNames().filter(f => f.endsWith(".vue"));
+    return project.getFileNames().filter((f) => f.endsWith(".vue"));
   }
 
   return { create, getExternalFiles };
