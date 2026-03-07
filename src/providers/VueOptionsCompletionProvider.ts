@@ -1,5 +1,5 @@
 import * as vscode from "vscode";
-import { TreeSitterParser } from "../core/TreeSitterParser";
+import { TreeSitterParser, type VueOptionsIndex, type VueOptionsIndexEntry } from "../core/TreeSitterParser";
 import { VuePrototypeScanner, VueDollarProperty } from "../core/VuePrototypeScanner";
 
 /**
@@ -16,15 +16,7 @@ export class VueOptionsCompletionProvider implements vscode.CompletionItemProvid
   private cache: {
     uri: string;
     version: number;
-    properties: { name: string; source: string; inferredType?: string }[];
-  } | null = null;
-
-  // Cache for nested property completions (keyed by uri + version + chain)
-  private nestedCache: {
-    uri: string;
-    version: number;
-    chainKey: string;
-    properties: { name: string; inferredType?: string }[];
+    index: VueOptionsIndex;
   } | null = null;
 
   constructor(prototypeScanner?: VuePrototypeScanner) {
@@ -73,19 +65,12 @@ export class VueOptionsCompletionProvider implements vscode.CompletionItemProvid
 
     // ── Component properties (data / methods / computed / props / watch) ──
     if (token.isCancellationRequested) return null;
-    let properties: { name: string; source: string; inferredType?: string }[];
-    const uri = document.uri.toString();
-    if (this.cache && this.cache.uri === uri && this.cache.version === document.version) {
-      properties = this.cache.properties;
-    } else {
-      const fileContent = document.getText();
-      try {
-        properties = await this.treeSitterParser.collectVueOptionProperties(fileContent);
-      } catch (e) {
-        console.error("VueOptionsCompletionProvider error:", e);
-        properties = [];
-      }
-      this.cache = { uri, version: document.version, properties };
+    let properties: VueOptionsIndexEntry[] = [];
+    try {
+      const index = await this.getIndex(document);
+      properties = index.properties;
+    } catch (e) {
+      console.error("VueOptionsCompletionProvider error:", e);
     }
 
     for (const prop of properties) {
@@ -154,20 +139,9 @@ export class VueOptionsCompletionProvider implements vscode.CompletionItemProvid
     );
 
     try {
-      const uri = document.uri.toString();
       const chainKey = chain.join('.');
-      let nestedProps: { name: string; inferredType?: string }[];
-
-      if (this.nestedCache && this.nestedCache.uri === uri
-        && this.nestedCache.version === document.version
-        && this.nestedCache.chainKey === chainKey) {
-        nestedProps = this.nestedCache.properties;
-      } else {
-        nestedProps = await this.treeSitterParser.collectNestedProperties(
-          document.getText(), chain
-        );
-        this.nestedCache = { uri, version: document.version, chainKey, properties: nestedProps };
-      }
+      const index = await this.getIndex(document);
+      const nestedProps = index.childrenByPath.get(chainKey) || [];
 
       if (nestedProps.length === 0) return null;
 
@@ -215,5 +189,18 @@ export class VueOptionsCompletionProvider implements vscode.CompletionItemProvid
       case 'watch':    return '4';
       default:         return '9';
     }
+  }
+
+  private async getIndex(document: vscode.TextDocument): Promise<VueOptionsIndex> {
+    const uri = document.uri.toString();
+    const version = document.version;
+
+    if (this.cache && this.cache.uri === uri && this.cache.version === version) {
+      return this.cache.index;
+    }
+
+    const index = await this.treeSitterParser.getVueOptionsIndex(document.getText());
+    this.cache = { uri, version, index };
+    return index;
   }
 }

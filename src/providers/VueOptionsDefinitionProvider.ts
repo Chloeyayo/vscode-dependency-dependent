@@ -5,7 +5,8 @@ import { VuePrototypeScanner } from "../core/VuePrototypeScanner";
 /**
  * Vue2 Options API Definition Provider
  * Enables Ctrl+Click navigation for:
- * - this.xxx -> data / methods / computed / props
+ * - this.xxx -> data / methods / computed / props / watch
+ * - this.obj.xxx -> nested object properties indexed from data/computed literals
  * - this.$xxx -> Vue.prototype assignments / plugin imports in entry files
  */
 export class VueOptionsDefinitionProvider implements vscode.DefinitionProvider {
@@ -40,10 +41,11 @@ export class VueOptionsDefinitionProvider implements vscode.DefinitionProvider {
 
     if (token.isCancellationRequested) return null;
 
-    // Otherwise: try component property definition (data/methods/computed/props)
+    // Otherwise: try component property definition from the shared VueOptionsIndex
     const fileContent = document.getText();
     try {
-      const result = await this.treeSitterParser.findVueOptionDefinition(fileContent, targetWord);
+      const chain = this.getThisPropertyChain(document, wordRange, targetWord);
+      const result = await this.treeSitterParser.findVueOptionDefinition(fileContent, targetWord, chain);
 
       if (result) {
         const startPos = document.positionAt(result.start);
@@ -73,5 +75,23 @@ export class VueOptionsDefinitionProvider implements vscode.DefinitionProvider {
       console.error("VueOptionsDefinitionProvider $xxx lookup error:", e);
       return null;
     }
+  }
+
+  private getThisPropertyChain(
+    document: vscode.TextDocument,
+    wordRange: vscode.Range,
+    targetWord: string,
+  ): string[] {
+    const lineText = document.lineAt(wordRange.end.line).text;
+    const beforeWordEnd = lineText.substring(0, wordRange.end.character);
+    const match = beforeWordEnd.match(/\bthis\.([\$\w]+(?:\.[\$\w]+)*)$/);
+    if (!match) return [];
+
+    const chain = match[1].split('.');
+    if (chain[chain.length - 1] !== targetWord) {
+      return [];
+    }
+
+    return chain;
   }
 }

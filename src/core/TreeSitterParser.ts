@@ -90,6 +90,23 @@ const LANG_WASM_MAP: Record<string, string> = {
 // Global flag to find ALL script blocks; we then prefer the non-setup one.
 const VUE_SCRIPT_RE = /<script(\b[^>]*)?>([^]*?)<\/script>/gi;
 
+export type VueOptionSource = 'data' | 'methods' | 'computed' | 'props' | 'watch';
+
+export interface VueOptionsIndexEntry {
+    path: string;
+    name: string;
+    source: VueOptionSource;
+    inferredType?: string;
+    start: number;
+    end: number;
+}
+
+export interface VueOptionsIndex {
+    properties: VueOptionsIndexEntry[];
+    entriesByPath: Map<string, VueOptionsIndexEntry>;
+    childrenByPath: Map<string, VueOptionsIndexEntry[]>;
+}
+
 export class TreeSitterParser {
     private static instance: TreeSitterParser;
     private parsers: Map<string, Parser> = new Map();
@@ -100,6 +117,8 @@ export class TreeSitterParser {
     /** LRU tree cache keyed by content hash — avoids thrashing when parsing multiple files */
     private treeCache: Map<number, { langId: string; tree: any }> = new Map();
     private static readonly TREE_CACHE_MAX = 10;
+    private vueOptionsIndexCache: Map<number, VueOptionsIndex> = new Map();
+    private static readonly VUE_OPTIONS_INDEX_CACHE_MAX = 10;
     private wasmDir: string;
     private initialized = false;
     private missingLanguageLog = new Set<string>();
@@ -213,6 +232,7 @@ export class TreeSitterParser {
             cached.tree?.delete?.();
         }
         this.treeCache.clear();
+        this.vueOptionsIndexCache.clear();
         this.parsers.clear();
         this.languages.clear();
         this.importQueries.clear();
@@ -230,6 +250,22 @@ export class TreeSitterParser {
             const entry = this.treeCache.get(oldest);
             entry?.tree?.delete?.();
             this.treeCache.delete(oldest);
+        }
+    }
+
+    private createEmptyVueOptionsIndex(): VueOptionsIndex {
+        return {
+            properties: [],
+            entriesByPath: new Map(),
+            childrenByPath: new Map(),
+        };
+    }
+
+    private evictVueOptionsIndexCache(): void {
+        while (this.vueOptionsIndexCache.size > TreeSitterParser.VUE_OPTIONS_INDEX_CACHE_MAX) {
+            const oldest = this.vueOptionsIndexCache.keys().next().value;
+            if (oldest === undefined) break;
+            this.vueOptionsIndexCache.delete(oldest);
         }
     }
 
@@ -504,30 +540,50 @@ export class TreeSitterParser {
     }
 
     /**
-     * Find Vue Options definition (data/methods/computed/props) in a .vue file
-     * Returns the absolute offset range in the original Vue file
+     * Build a shared Vue Options index for completions and definitions.
+     */
+    public async getVueOptionsIndex(content: string): Promise<VueOptionsIndex> {
+        const hash = this.hashContent(content);
+        const cached = this.vueOptionsIndexCache.get(hash);
+        if (cached) {
+            this.vueOptionsIndexCache.delete(hash);
+            this.vueOptionsIndexCache.set(hash, cached);
+            return cached;
+        }
+
+        let index = this.createEmptyVueOptionsIndex();
+        const scriptInfo = this.extractVueScriptInfo(content);
+        if (scriptInfo) {
+            const { scriptContent, scriptOffset } = scriptInfo;
+            const tsTree = await this.parseWithCache('typescript', scriptContent);
+            if (tsTree) {
+                index = this.buildVueOptionsIndex(tsTree, scriptOffset);
+            }
+        }
+
+        this.vueOptionsIndexCache.set(hash, index);
+        this.evictVueOptionsIndexCache();
+        return index;
+    }
+
+    /**
+     * Find Vue Options definition (data/methods/computed/props/watch) in a .vue file.
+     * Returns the absolute offset range in the original Vue file.
      */
     public async findVueOptionDefinition(
         content: string,
-        targetWord: string
+        targetWord: string,
+        chain: string[] = []
     ): Promise<{ start: number; end: number } | null> {
-        const scriptInfo = this.extractVueScriptInfo(content);
-        if (!scriptInfo) return null;
+        const index = await this.getVueOptionsIndex(content);
+        const pathKey = chain.length > 0 ? chain.join('.') : targetWord;
+        const entry = index.entriesByPath.get(pathKey) || index.entriesByPath.get(targetWord);
 
-        const { scriptContent, scriptOffset } = scriptInfo;
-
-        const tsTree = await this.parseWithCache('typescript', scriptContent);
-        if (!tsTree) return null;
-
-        const result = this.findOptionPropertyInTree(tsTree, targetWord);
-        if (result) {
-            return {
-                start: scriptOffset + result.start,
-                end: scriptOffset + result.end
-            };
-        }
-
-        return null;
+        if (!entry) return null;
+        return {
+            start: entry.start,
+            end: entry.end
+        };
     }
 
     /**
@@ -536,81 +592,172 @@ export class TreeSitterParser {
      */
     public async collectVueOptionProperties(
         content: string
-    ): Promise<{ name: string; source: 'data' | 'methods' | 'computed' | 'props' | 'watch'; inferredType?: string }[]> {
-        const scriptInfo = this.extractVueScriptInfo(content);
-        if (!scriptInfo) return [];
-
-        const { scriptContent } = scriptInfo;
-
-        const tsTree = await this.parseWithCache('typescript', scriptContent);
-        if (!tsTree) return [];
-
-        return this.collectOptionPropertiesInTree(tsTree);
+    ): Promise<{ name: string; source: VueOptionSource; inferredType?: string }[]> {
+        const index = await this.getVueOptionsIndex(content);
+        return index.properties.map(({ name, source, inferredType }) => ({
+            name,
+            source,
+            inferredType
+        }));
     }
 
-    /**
-     * Traverse the export default object and collect all property names from
-     * data(), methods, computed, and props sections.
-     */
-    private collectOptionPropertiesInTree(
-        tree: any
-    ): { name: string; source: 'data' | 'methods' | 'computed' | 'props' | 'watch'; inferredType?: string }[] {
+    private buildVueOptionsIndex(tree: any, scriptOffset: number): VueOptionsIndex {
         const root = tree.rootNode;
-        const results: { name: string; source: 'data' | 'methods' | 'computed' | 'props' | 'watch'; inferredType?: string }[] = [];
+        const index = this.createEmptyVueOptionsIndex();
 
         const exportStmt = this.findNodeByType(root, 'export_statement');
-        if (!exportStmt) return results;
+        if (!exportStmt) return index;
 
         const objectNode = this.findNodeByType(exportStmt, 'object');
-        if (!objectNode) return results;
+        if (!objectNode) return index;
 
         for (const child of objectNode.children) {
-            if (child.type === 'pair' || child.type === 'method_definition') {
-                const keyNode = child.childForFieldName('key') || child.childForFieldName('name');
-                if (!keyNode) continue;
+            if (child.type !== 'pair' && child.type !== 'method_definition') {
+                continue;
+            }
 
-                const keyName = keyNode.text;
+            const keyName = this.getObjectPropertyName(child);
+            if (!keyName) continue;
 
-                // methods / computed / props / watch: collect all keys from the value object
-                if (['methods', 'computed', 'props', 'watch'].includes(keyName)) {
-                    const source = keyName as 'methods' | 'computed' | 'props' | 'watch';
-                    const valueNode = child.childForFieldName('value');
-
-                    if (valueNode && valueNode.type === 'object') {
-                        this.collectPropertyNames(valueNode, source, results);
-                    }
-
-                    // props can be an array: props: ['foo', 'bar']
-                    if (keyName === 'props' && valueNode && valueNode.type === 'array') {
-                        for (const elem of valueNode.children) {
-                            if (elem.type === 'string' || elem.type === 'string_fragment') {
-                                const text = elem.text.replace(/^['"`]|['"`]$/g, '');
-                                if (text) {
-                                    results.push({ name: text, source: 'props' });
-                                }
-                            }
-                        }
-                    }
+            if (keyName === 'data') {
+                const returnObject = this.findDataReturnObject(child);
+                if (returnObject) {
+                    this.indexTopLevelSectionProperties(index, returnObject, 'data', scriptOffset);
                 }
+                continue;
+            }
 
-                // data(): collect keys from the return object
-                if (keyName === 'data') {
-                    const bodyNode = child.childForFieldName('body') ||
-                                     child.childForFieldName('value')?.childForFieldName('body');
-                    if (bodyNode) {
-                        const returnStmt = this.findNodeByType(bodyNode, 'return_statement');
-                        if (returnStmt) {
-                            const returnObj = this.findNodeByType(returnStmt, 'object');
-                            if (returnObj) {
-                                this.collectPropertyNames(returnObj, 'data', results);
-                            }
-                        }
-                    }
-                }
+            if (!['methods', 'computed', 'props', 'watch'].includes(keyName)) {
+                continue;
+            }
+
+            const source = keyName as VueOptionSource;
+            const valueNode = child.childForFieldName('value');
+
+            if (valueNode && valueNode.type === 'object') {
+                this.indexTopLevelSectionProperties(index, valueNode, source, scriptOffset);
+            }
+
+            if (source === 'props' && valueNode && valueNode.type === 'array') {
+                this.indexPropsArrayProperties(index, valueNode, scriptOffset);
             }
         }
 
-        return results;
+        return index;
+    }
+
+    private indexTopLevelSectionProperties(
+        index: VueOptionsIndex,
+        objectNode: any,
+        source: VueOptionSource,
+        scriptOffset: number
+    ): void {
+        for (const child of objectNode.children) {
+            if (!this.isIndexableObjectProperty(child)) {
+                continue;
+            }
+
+            const name = this.getObjectPropertyName(child);
+            const range = this.getObjectPropertyRange(child);
+            if (!name || !range) continue;
+
+            const entry: VueOptionsIndexEntry = {
+                path: name,
+                name,
+                source,
+                inferredType: this.getTopLevelEntryType(child, source),
+                start: scriptOffset + range.start,
+                end: scriptOffset + range.end,
+            };
+
+            const isPrimaryPath = this.addVueOptionsIndexEntry(index, entry);
+            if (!isPrimaryPath) continue;
+
+            const nestedObject = this.getTopLevelNestedObjectNode(child, source);
+            if (nestedObject) {
+                this.indexNestedObjectLiteral(index, nestedObject, source, entry.path, scriptOffset);
+            }
+        }
+    }
+
+    private indexPropsArrayProperties(
+        index: VueOptionsIndex,
+        arrayNode: any,
+        scriptOffset: number
+    ): void {
+        for (const elem of arrayNode.children) {
+            if (elem.type !== 'string' && elem.type !== 'string_fragment') {
+                continue;
+            }
+
+            const name = elem.text.replace(/^['"`]|['"`]$/g, '');
+            if (!name) continue;
+
+            this.addVueOptionsIndexEntry(index, {
+                path: name,
+                name,
+                source: 'props',
+                start: scriptOffset + elem.startIndex,
+                end: scriptOffset + elem.endIndex,
+            });
+        }
+    }
+
+    private indexNestedObjectLiteral(
+        index: VueOptionsIndex,
+        objectNode: any,
+        source: VueOptionSource,
+        parentPath: string,
+        scriptOffset: number
+    ): void {
+        for (const child of objectNode.children) {
+            if (!this.isIndexableObjectProperty(child)) {
+                continue;
+            }
+
+            const name = this.getObjectPropertyName(child);
+            const range = this.getObjectPropertyRange(child);
+            if (!name || !range) continue;
+
+            const path = `${parentPath}.${name}`;
+            const entry: VueOptionsIndexEntry = {
+                path,
+                name,
+                source,
+                inferredType: this.getNestedLiteralEntryType(child),
+                start: scriptOffset + range.start,
+                end: scriptOffset + range.end,
+            };
+
+            const isPrimaryPath = this.addVueOptionsIndexEntry(index, entry, parentPath);
+            if (!isPrimaryPath) continue;
+
+            const nestedObject = this.getNestedLiteralObjectNode(child);
+            if (nestedObject) {
+                this.indexNestedObjectLiteral(index, nestedObject, source, path, scriptOffset);
+            }
+        }
+    }
+
+    private addVueOptionsIndexEntry(
+        index: VueOptionsIndex,
+        entry: VueOptionsIndexEntry,
+        parentPath?: string
+    ): boolean {
+        if (parentPath) {
+            const siblings = index.childrenByPath.get(parentPath) || [];
+            siblings.push(entry);
+            index.childrenByPath.set(parentPath, siblings);
+        } else {
+            index.properties.push(entry);
+        }
+
+        if (index.entriesByPath.has(entry.path)) {
+            return false;
+        }
+
+        index.entriesByPath.set(entry.path, entry);
+        return true;
     }
 
     /**
@@ -680,46 +827,9 @@ export class TreeSitterParser {
      * Infer the return type from a computed property function body.
      */
     private inferComputedReturnType(node: any): string {
-        // method_definition: has 'body' field
-        const body = node.childForFieldName('body');
-        if (body) {
-            const returnStmt = this.findNodeByType(body, 'return_statement');
-            if (returnStmt) {
-                // The return value is the first non-keyword child
-                for (const child of returnStmt.children) {
-                    if (child.type !== 'return') {
-                        return this.inferTypeFromNode(child);
-                    }
-                }
-            }
-        }
-        // pair with function value
-        const value = node.childForFieldName('value');
-        if (value) {
-            const funcBody = value.childForFieldName('body');
-            if (funcBody) {
-                const returnStmt = this.findNodeByType(funcBody, 'return_statement');
-                if (returnStmt) {
-                    for (const child of returnStmt.children) {
-                        if (child.type !== 'return') {
-                            return this.inferTypeFromNode(child);
-                        }
-                    }
-                }
-            }
-            // Computed with get/set: look for get method
-            if (value.type === 'object') {
-                for (const child of value.children) {
-                    if (child.type === 'method_definition' || child.type === 'pair') {
-                        const keyNode = child.childForFieldName('key') || child.childForFieldName('name');
-                        if (keyNode && keyNode.text === 'get') {
-                            return this.inferComputedReturnType(child);
-                        }
-                    }
-                }
-            }
-        }
-        return 'any';
+        const returnValue = this.findReturnValueNode(node);
+        if (!returnValue) return 'any';
+        return this.inferTypeFromNode(returnValue);
     }
 
     /**
@@ -774,206 +884,151 @@ export class TreeSitterParser {
     }
 
     /**
-     * Collect all property/method names from an object literal node.
-     */
-    private collectPropertyNames(
-        objectNode: any,
-        source: 'data' | 'methods' | 'computed' | 'props' | 'watch',
-        results: { name: string; source: typeof source; inferredType?: string }[]
-    ): void {
-        for (const child of objectNode.children) {
-            if (child.type === 'pair' || child.type === 'method_definition') {
-                const keyNode = child.childForFieldName('key') || child.childForFieldName('name');
-                if (keyNode) {
-                    let inferredType: string | undefined;
-                    if (source === 'data') {
-                        const valueNode = child.childForFieldName('value');
-                        if (valueNode) {
-                            inferredType = this.inferTypeFromNode(valueNode);
-                        }
-                    } else if (source === 'computed') {
-                        inferredType = this.inferComputedReturnType(child);
-                    } else if (source === 'props') {
-                        const valueNode = child.childForFieldName('value');
-                        if (valueNode) {
-                            inferredType = this.inferPropType(valueNode);
-                        }
-                    } else if (source === 'methods') {
-                        inferredType = 'Function';
-                    }
-                    if (inferredType === 'any') inferredType = undefined;
-                    results.push({ name: keyNode.text, source, inferredType });
-                }
-            } else if (child.type === 'shorthand_property_identifier') {
-                results.push({ name: child.text, source });
-            }
-        }
-    }
-
-    /**
-     * Given a property chain like ['obj', 'inner'], resolve the nested object
-     * in data/computed/props and return its property names.
+     * Given a property chain like ['obj', 'inner'], return the indexed children.
      */
     public async collectNestedProperties(
         content: string,
         chain: string[]
     ): Promise<{ name: string; inferredType?: string }[]> {
         if (chain.length === 0) return [];
-
-        const scriptInfo = this.extractVueScriptInfo(content);
-        if (!scriptInfo) return [];
-
-        const tsTree = await this.parseWithCache('typescript', scriptInfo.scriptContent);
-        if (!tsTree) return [];
-
-        const root = tsTree.rootNode;
-        const exportStmt = this.findNodeByType(root, 'export_statement');
-        if (!exportStmt) return [];
-
-        const objectNode = this.findNodeByType(exportStmt, 'object');
-        if (!objectNode) return [];
-
-        // Search through data, computed, props, methods for the first property in chain
-        let targetNode: any = null;
-
-        for (const child of objectNode.children) {
-            if (child.type !== 'pair' && child.type !== 'method_definition') continue;
-            const keyNode = child.childForFieldName('key') || child.childForFieldName('name');
-            if (!keyNode) continue;
-            const keyName = keyNode.text;
-
-            if (keyName === 'data') {
-                const bodyNode = child.childForFieldName('body') ||
-                    child.childForFieldName('value')?.childForFieldName('body');
-                if (bodyNode) {
-                    const returnStmt = this.findNodeByType(bodyNode, 'return_statement');
-                    if (returnStmt) {
-                        const returnObj = this.findNodeByType(returnStmt, 'object');
-                        if (returnObj) {
-                            targetNode = this.findNestedObject(returnObj, chain);
-                            if (targetNode) break;
-                        }
-                    }
-                }
-            } else if (['computed', 'props', 'methods'].includes(keyName)) {
-                const valueNode = child.childForFieldName('value');
-                if (valueNode && valueNode.type === 'object') {
-                    targetNode = this.findNestedObject(valueNode, chain);
-                    if (targetNode) break;
-                }
-            }
-        }
-
-        if (!targetNode || targetNode.type !== 'object') return [];
-
-        const props: { name: string; inferredType?: string }[] = [];
-        for (const c of targetNode.children) {
-            if (c.type === 'pair' || c.type === 'method_definition') {
-                const k = c.childForFieldName('key') || c.childForFieldName('name');
-                if (k) {
-                    const valueNode = c.childForFieldName('value');
-                    let inferredType: string | undefined;
-                    if (valueNode) {
-                        inferredType = this.inferTypeFromNode(valueNode);
-                        if (inferredType === 'any') inferredType = undefined;
-                    }
-                    props.push({ name: k.text, inferredType });
-                }
-            } else if (c.type === 'shorthand_property_identifier') {
-                props.push({ name: c.text });
-            }
-        }
-        return props;
+        const index = await this.getVueOptionsIndex(content);
+        const entries = index.childrenByPath.get(chain.join('.')) || [];
+        return entries.map(({ name, inferredType }) => ({ name, inferredType }));
     }
 
-    /**
-     * Walk a chain of property names through nested object literals.
-     * Returns the value node of the last property in the chain.
-     */
-    private findNestedObject(objectNode: any, chain: string[]): any {
-        let current = objectNode;
-        for (const propName of chain) {
-            if (!current || current.type !== 'object') return null;
-            let found = false;
-            for (const child of current.children) {
-                if (child.type === 'pair') {
-                    const keyNode = child.childForFieldName('key');
-                    if (keyNode && keyNode.text === propName) {
-                        current = child.childForFieldName('value');
-                        found = true;
-                        break;
-                    }
-                }
-            }
-            if (!found) return null;
+    private getTopLevelEntryType(node: any, source: VueOptionSource): string | undefined {
+        if (source === 'methods') {
+            return 'Function';
         }
-        return current;
+
+        if (source === 'computed') {
+            return this.normalizeInferredType(this.inferComputedReturnType(node));
+        }
+
+        const valueNode = node.childForFieldName('value');
+        if (!valueNode) {
+            return node.type === 'method_definition' ? 'Function' : undefined;
+        }
+
+        if (source === 'props') {
+            return this.normalizeInferredType(this.inferPropType(valueNode));
+        }
+
+        if (source === 'data') {
+            return this.normalizeInferredType(this.inferTypeFromNode(valueNode));
+        }
+
+        return undefined;
     }
 
-    // (removed - replaced by extractVueScriptInfo)
+    private getNestedLiteralEntryType(node: any): string | undefined {
+        if (node.type === 'method_definition') {
+            return 'Function';
+        }
 
-    private findOptionPropertyInTree(tree: any, targetWord: string): { start: number; end: number } | null {
-        const root = tree.rootNode;
+        const valueNode = node.childForFieldName('value');
+        if (!valueNode) return undefined;
+        return this.normalizeInferredType(this.inferTypeFromNode(valueNode));
+    }
 
-        const exportStmt = this.findNodeByType(root, 'export_statement');
-        if (!exportStmt) return null;
+    private getTopLevelNestedObjectNode(node: any, source: VueOptionSource): any | null {
+        if (source === 'data') {
+            const valueNode = node.childForFieldName('value');
+            return valueNode?.type === 'object' ? valueNode : null;
+        }
 
-        const objectNode = this.findNodeByType(exportStmt, 'object');
-        if (!objectNode) return null;
-
-        for (const child of objectNode.children) {
-            if (child.type === 'pair' || child.type === 'method_definition') {
-                const keyNode = child.childForFieldName('key') || child.childForFieldName('name');
-                if (!keyNode) continue;
-
-                const keyName = keyNode.text;
-
-                if (['methods', 'computed', 'props'].includes(keyName)) {
-                    const valueNode = child.childForFieldName('value');
-                    if (valueNode && valueNode.type === 'object') {
-                        const found = this.findPropertyInObject(valueNode, targetWord);
-                        if (found) return found;
-                    }
-                }
-
-                if (keyName === 'data') {
-                    const bodyNode = child.childForFieldName('body') ||
-                                     child.childForFieldName('value')?.childForFieldName('body');
-                    if (bodyNode) {
-                        const returnStmt = this.findNodeByType(bodyNode, 'return_statement');
-                        if (returnStmt) {
-                            const returnObj = this.findNodeByType(returnStmt, 'object');
-                            if (returnObj) {
-                                const found = this.findPropertyInObject(returnObj, targetWord);
-                                if (found) return found;
-                            }
-                        }
-                    }
-                }
-            }
+        if (source === 'computed') {
+            const returnValue = this.findReturnValueNode(node);
+            return returnValue?.type === 'object' ? returnValue : null;
         }
 
         return null;
     }
 
-    private findPropertyInObject(objectNode: any, targetWord: string): { start: number; end: number } | null {
-        for (const child of objectNode.children) {
-            if (child.type === 'pair' || child.type === 'method_definition' || child.type === 'shorthand_property_identifier') {
-                let keyNode = child.childForFieldName('key') || child.childForFieldName('name');
+    private getNestedLiteralObjectNode(node: any): any | null {
+        const valueNode = node.childForFieldName('value');
+        return valueNode?.type === 'object' ? valueNode : null;
+    }
 
-                if (child.type === 'shorthand_property_identifier') {
-                    if (child.text === targetWord) {
-                        return { start: child.startIndex, end: child.endIndex };
-                    }
+    private normalizeInferredType(type?: string): string | undefined {
+        if (!type || type === 'any') return undefined;
+        return type;
+    }
+
+    private isIndexableObjectProperty(node: any): boolean {
+        return node.type === 'pair' ||
+            node.type === 'method_definition' ||
+            node.type === 'shorthand_property_identifier';
+    }
+
+    private getObjectPropertyName(node: any): string | null {
+        if (node.type === 'shorthand_property_identifier') {
+            return node.text;
+        }
+
+        const keyNode = node.childForFieldName('key') || node.childForFieldName('name');
+        return keyNode?.text || null;
+    }
+
+    private getObjectPropertyRange(node: any): { start: number; end: number } | null {
+        if (!this.isIndexableObjectProperty(node)) {
+            return null;
+        }
+
+        return {
+            start: node.startIndex,
+            end: node.endIndex,
+        };
+    }
+
+    private findDataReturnObject(node: any): any | null {
+        const bodyNode = node.childForFieldName('body') ||
+            node.childForFieldName('value')?.childForFieldName('body');
+        if (!bodyNode) return null;
+
+        const returnValue = this.findReturnValueNodeInBody(bodyNode);
+        return returnValue?.type === 'object' ? returnValue : null;
+    }
+
+    private findReturnValueNode(node: any): any | null {
+        const bodyNode = node.childForFieldName('body');
+        if (bodyNode) {
+            const returnValue = this.findReturnValueNodeInBody(bodyNode);
+            if (returnValue) return returnValue;
+        }
+
+        const valueNode = node.childForFieldName('value');
+        if (!valueNode) return null;
+
+        const valueBodyNode = valueNode.childForFieldName('body');
+        if (valueBodyNode) {
+            const returnValue = this.findReturnValueNodeInBody(valueBodyNode);
+            if (returnValue) return returnValue;
+        }
+
+        if (valueNode.type === 'object') {
+            for (const child of valueNode.children) {
+                if (child.type !== 'method_definition' && child.type !== 'pair') {
                     continue;
                 }
 
-                if (keyNode && keyNode.text === targetWord) {
-                    return { start: child.startIndex, end: child.endIndex };
+                const keyName = this.getObjectPropertyName(child);
+                if (keyName === 'get') {
+                    return this.findReturnValueNode(child);
                 }
             }
         }
+
         return null;
+    }
+
+    private findReturnValueNodeInBody(bodyNode: any): any | null {
+        const returnStmt = this.findNodeByType(bodyNode, 'return_statement');
+        if (!returnStmt) return null;
+
+        return returnStmt.children.find(
+            (child: any) => child.type !== 'return' && child.type !== ';'
+        ) || null;
     }
 
     private findNodeByType(node: any, type: string): any {
