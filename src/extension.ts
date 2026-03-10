@@ -13,6 +13,7 @@ import { VueTemplateCompletionProvider } from "./providers/VueTemplateCompletion
 import { VueRangeFormattingProvider } from "./providers/VueRangeFormattingProvider";
 import { VueComponentPropsCompletionProvider } from "./providers/VueComponentPropsCompletionProvider";
 import { VueComponentTagCompletionProvider } from "./providers/VueComponentTagCompletionProvider";
+import { VueStyleCompletionProvider } from "./providers/VueStyleCompletionProvider";
 
 import { WebpackDefinitionProvider } from "./providers/WebpackDefinitionProvider";
 import { VueOptionsDefinitionProvider } from "./providers/VueOptionsDefinitionProvider";
@@ -172,6 +173,17 @@ export function activate(context: vscode.ExtensionContext) {
   context.subscriptions.push(
     vueTagProvider,
     vscode.languages.registerCompletionItemProvider(vueSelector, vueTagProvider, '<')
+  );
+
+  // CSS/SCSS/Less completion inside <style> blocks
+  const vueStyleProvider = new VueStyleCompletionProvider();
+  context.subscriptions.push(
+    vueStyleProvider,
+    vscode.languages.registerCompletionItemProvider(
+      vueSelector,
+      vueStyleProvider,
+      ':', ';', ' ', '{', '.', '#', '-', '!', '@', '/', '(', '0', '1', '2', '3', '4', '5', '6', '7', '8', '9'
+    )
   );
 
   // Register Formatting Providers for Vue files (Format Selection and Format Document)
