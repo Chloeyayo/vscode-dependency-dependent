@@ -8,9 +8,15 @@ import {
   CompletionList as CSSCompletionList,
   Position as CSSPosition,
   CompletionItemKind as CSSCompletionItemKind,
-  TextEdit as CSSTextEdit,
+  Stylesheet,
 } from "vscode-css-languageservice";
 import { InsertReplaceEdit } from "vscode-languageserver-types";
+
+interface CachedRegions {
+  uri: string;
+  version: number;
+  regions: StyleRegion[];
+}
 
 /**
  * Style region info extracted from a Vue SFC.
@@ -72,20 +78,20 @@ function mapCompletionItemKind(
  * instead invokes the same CSS engine that powers VS Code's built-in CSS support.
  */
 export class VueStyleCompletionProvider
-  implements vscode.CompletionItemProvider, vscode.Disposable
+  implements vscode.CompletionItemProvider
 {
   private cssLS: CSSLanguageService;
   private scssLS: CSSLanguageService;
   private lessLS: CSSLanguageService;
+  private stylesheetCache = new Map<string, Stylesheet>();
+  private lastCacheVersion = -1;
+  private lastCacheUri = "";
+  private regionCache: CachedRegions | null = null;
 
   constructor() {
     this.cssLS = getCSSLanguageService();
     this.scssLS = getSCSSLanguageService();
     this.lessLS = getLESSLanguageService();
-  }
-
-  dispose(): void {
-    // No resources to release
   }
 
   async provideCompletionItems(
@@ -98,9 +104,11 @@ export class VueStyleCompletionProvider
 
     const text = document.getText();
     const offset = document.offsetAt(position);
+    const uri = document.uri.toString();
+    const version = document.version;
 
-    // Find the style region containing the cursor
-    const regions = this.parseStyleRegions(text);
+    // Find the style region containing the cursor (cached by uri+version)
+    const regions = this.getCachedRegions(uri, version, text);
     const region = regions.find(
       (r) => offset > r.contentStart && offset <= r.contentEnd
     );
@@ -120,8 +128,8 @@ export class VueStyleCompletionProvider
       styleContent
     );
 
-    // Parse the stylesheet
-    const stylesheet = ls.parseStylesheet(cssDoc);
+    // Parse the stylesheet (cached by uri+version+contentStart)
+    const stylesheet = this.getStylesheet(ls, cssDoc, uri, version, region.contentStart);
 
     // Compute the relative position within the extracted style content
     const relativeOffset = offset - region.contentStart;
@@ -245,12 +253,45 @@ export class VueStyleCompletionProvider
     }
   }
 
+  private getStylesheet(
+    ls: CSSLanguageService,
+    doc: CSSTextDocument,
+    uri: string,
+    version: number,
+    contentStart: number
+  ): Stylesheet {
+    // Invalidate entire cache when document changes
+    if (uri !== this.lastCacheUri || version !== this.lastCacheVersion) {
+      this.stylesheetCache.clear();
+      this.lastCacheUri = uri;
+      this.lastCacheVersion = version;
+    }
+    const key = String(contentStart);
+    let stylesheet = this.stylesheetCache.get(key);
+    if (!stylesheet) {
+      stylesheet = ls.parseStylesheet(doc);
+      this.stylesheetCache.set(key, stylesheet);
+    }
+    return stylesheet;
+  }
+
+  private getCachedRegions(uri: string, version: number, text: string): StyleRegion[] {
+    const c = this.regionCache;
+    if (c && c.uri === uri && c.version === version) {
+      return c.regions;
+    }
+    const regions = this.parseStyleRegions(text);
+    this.regionCache = { uri, version, regions };
+    return regions;
+  }
+
   /**
    * Parse the Vue SFC to find <style> regions.
    */
   private parseStyleRegions(text: string): StyleRegion[] {
     const regions: StyleRegion[] = [];
     const blockPattern = /^<style(\b[^>]*)>/gim;
+    const closingRe = /<\/style\s*>/gim;
     let match: RegExpExecArray | null;
 
     while ((match = blockPattern.exec(text)) !== null) {
@@ -266,12 +307,12 @@ export class VueStyleCompletionProvider
       const attrs = match[1] || "";
       const contentStart = match.index + match[0].length;
 
-      // Find matching </style>
-      const closingRe = /^<\/style\s*>/im;
-      const closeMatch = closingRe.exec(text.substring(contentStart));
+      // Find matching </style> from contentStart
+      closingRe.lastIndex = contentStart;
+      const closeMatch = closingRe.exec(text);
       if (!closeMatch) continue;
 
-      const contentEnd = contentStart + closeMatch.index;
+      const contentEnd = closeMatch.index;
       const langId = this.detectLangId(attrs);
 
       regions.push({ langId, contentStart, contentEnd });
