@@ -6,6 +6,8 @@
     { "include": "#template-block" },
     { "include": "#script-block-ts" },
     { "include": "#script-block-js" },
+    { "include": "#style-block-scss" },
+    { "include": "#style-block-less" },
     { "include": "#style-block" },
     { "include": "#vue-comment" }
   ],
@@ -87,6 +89,50 @@
       "contentName": "source.js",
       "patterns": [
         { "include": "source.js" }
+      ]
+    },
+    "style-block-scss": {
+      "begin": "(<)(style)(\\s+[^>]*\\blang\\s*=\\s*[\"'](?:scss|sass)[\"'][^>]*)(>)",
+      "beginCaptures": {
+        "1": { "name": "punctuation.definition.tag.begin.html.vue" },
+        "2": { "name": "entity.name.tag.html.vue" },
+        "3": {
+          "patterns": [{ "include": "#tag-attributes" }]
+        },
+        "4": { "name": "punctuation.definition.tag.end.html.vue" }
+      },
+      "end": "(</)(style)(\\s*>)",
+      "endCaptures": {
+        "1": { "name": "punctuation.definition.tag.begin.html.vue" },
+        "2": { "name": "entity.name.tag.html.vue" },
+        "3": { "name": "punctuation.definition.tag.end.html.vue" }
+      },
+      "name": "meta.style.block.vue",
+      "contentName": "source.css.scss",
+      "patterns": [
+        { "include": "source.css.scss" }
+      ]
+    },
+    "style-block-less": {
+      "begin": "(<)(style)(\\s+[^>]*\\blang\\s*=\\s*[\"']less[\"'][^>]*)(>)",
+      "beginCaptures": {
+        "1": { "name": "punctuation.definition.tag.begin.html.vue" },
+        "2": { "name": "entity.name.tag.html.vue" },
+        "3": {
+          "patterns": [{ "include": "#tag-attributes" }]
+        },
+        "4": { "name": "punctuation.definition.tag.end.html.vue" }
+      },
+      "end": "(</)(style)(\\s*>)",
+      "endCaptures": {
+        "1": { "name": "punctuation.definition.tag.begin.html.vue" },
+        "2": { "name": "entity.name.tag.html.vue" },
+        "3": { "name": "punctuation.definition.tag.end.html.vue" }
+      },
+      "name": "meta.style.block.vue",
+      "contentName": "source.css.less",
+      "patterns": [
+        { "include": "source.css.less" }
       ]
     },
     "style-block": {

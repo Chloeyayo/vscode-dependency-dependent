@@ -40,6 +40,43 @@ function isEscapedAt(text: string, pos: number): boolean {
   return backslashes % 2 === 1;
 }
 
+/**
+ * Forward-scan from an open bracket at `openPos` to find its matching close bracket.
+ * Handles nesting, strings (single/double/backtick), line comments, and block comments.
+ * Returns the index of the matching close bracket, or -1 if not found.
+ */
+function findMatchForward(text: string, openPos: number): number {
+  const open = text[openPos];
+  const close = BS_OPEN_CLOSE[open];
+  if (!close) return -1;
+  let depth = 0;
+  let state: 'code' | 'str' | 'line_cmt' | 'block_cmt' = 'code';
+  let strChar = '';
+  for (let i = openPos; i < text.length; i++) {
+    const c = text[i];
+    switch (state) {
+      case 'code':
+        if (c === '/' && text[i + 1] === '/') { state = 'line_cmt'; i++; }
+        else if (c === '/' && text[i + 1] === '*') { state = 'block_cmt'; i++; }
+        else if (c === '"' || c === "'" || c === '`') { state = 'str'; strChar = c; }
+        else if (c === open) { depth++; }
+        else if (c === close) { depth--; if (depth === 0) return i; }
+        break;
+      case 'str':
+        if (c === '\\') { i++; }
+        else if (c === strChar) { state = 'code'; }
+        break;
+      case 'line_cmt':
+        if (c === '\n') state = 'code';
+        break;
+      case 'block_cmt':
+        if (c === '*' && text[i + 1] === '/') { state = 'code'; i++; }
+        break;
+    }
+  }
+  return -1;
+}
+
 // Stored for deactivate() to cancel
 let _debouncedRefresh: ReturnType<typeof debounce> | undefined;
 
@@ -178,7 +215,6 @@ export function activate(context: vscode.ExtensionContext) {
   // CSS/SCSS/Less completion inside <style> blocks
   const vueStyleProvider = new VueStyleCompletionProvider();
   context.subscriptions.push(
-    vueStyleProvider,
     vscode.languages.registerCompletionItemProvider(
       vueSelector,
       vueStyleProvider,
@@ -213,6 +249,234 @@ export function activate(context: vscode.ExtensionContext) {
 
       let L = doc.offsetAt(sel.start);
       let R = doc.offsetAt(sel.end);
+
+      const isWordChar = (c: string) => /[a-zA-Z0-9_$]/.test(c);
+
+      // --- Phase 0: Member declaration / call-expression detection ---
+      // When cursor is on a word (no selection), try to select the entire member or call expression.
+      if (L === R) {
+
+        // Only fire when cursor is on a word character
+        if (L < len && isWordChar(text[L])) {
+          // 1. Find word boundaries at cursor
+          let wordStart = L;
+          while (wordStart > 0 && isWordChar(text[wordStart - 1])) wordStart--;
+          let wordEnd = L;
+          while (wordEnd < len && isWordChar(text[wordEnd])) wordEnd++;
+
+          // 2. Extend left through '.' + word to build dotted chain (e.g. this.$message)
+          let chainStart = wordStart;
+          {
+            let p = chainStart;
+            while (true) {
+              if (p > 0 && text[p - 1] === '.') {
+                let wStart = p - 2;
+                while (wStart >= 0 && isWordChar(text[wStart])) wStart--;
+                wStart++;
+                if (wStart < p - 1) {
+                  chainStart = wStart;
+                  p = wStart;
+                  continue;
+                }
+              }
+              break;
+            }
+          }
+
+          // 3. Extend right through '.' + word
+          let chainEnd = wordEnd;
+          {
+            let p = chainEnd;
+            while (true) {
+              if (p < len && text[p] === '.') {
+                let wEnd = p + 1;
+                while (wEnd < len && isWordChar(text[wEnd])) wEnd++;
+                if (wEnd > p + 1) {
+                  chainEnd = wEnd;
+                  p = wEnd;
+                  continue;
+                }
+              }
+              break;
+            }
+          }
+
+          // 4. Determine exprStart: scan backward past whitespace for async/await keyword
+          let exprStart = chainStart;
+          {
+            let p = chainStart - 1;
+            while (p >= 0 && (text[p] === ' ' || text[p] === '\t')) p--;
+            // Check for 'async' or 'await' keyword preceding the chain
+            for (const kw of ['async', 'await']) {
+              const kwStart = p - kw.length + 1;
+              if (kwStart >= 0 && text.substring(kwStart, p + 1) === kw) {
+                // Ensure it's a whole word (not part of a larger identifier)
+                if (kwStart === 0 || !isWordChar(text[kwStart - 1])) {
+                  exprStart = kwStart;
+                  break;
+                }
+              }
+            }
+          }
+
+          // 5. If the word at cursor IS "async"/"await" and the chain is just that keyword,
+          //    extend chainEnd forward to the next word/chain
+          const cursorWord = text.substring(wordStart, wordEnd);
+          if ((cursorWord === 'async' || cursorWord === 'await') && chainStart === wordStart && chainEnd === wordEnd) {
+            exprStart = wordStart;
+            let p = wordEnd;
+            while (p < len && (text[p] === ' ' || text[p] === '\t')) p++;
+            if (p < len && isWordChar(text[p])) {
+              let nextStart = p;
+              while (p < len && isWordChar(text[p])) p++;
+              chainEnd = p;
+              // Continue extending through dots
+              while (p < len && text[p] === '.') {
+                let wEnd = p + 1;
+                while (wEnd < len && isWordChar(text[wEnd])) wEnd++;
+                if (wEnd > p + 1) { chainEnd = wEnd; p = wEnd; } else break;
+              }
+            }
+          }
+
+          // 6. From chainEnd, skip whitespace, check next char
+          let p0 = chainEnd;
+          while (p0 < len && (text[p0] === ' ' || text[p0] === '\t')) p0++;
+
+          let memberEnd = -1;
+
+          if (p0 < len && text[p0] === ':') {
+            // Property pattern: name: value
+            let v = p0 + 1;
+            while (v < len && (text[v] === ' ' || text[v] === '\t' || text[v] === '\n' || text[v] === '\r')) v++;
+            if (v < len) {
+              const vc = text[v];
+              if (vc === '{' || vc === '[' || vc === '(') {
+                const closeIdx = findMatchForward(text, v);
+                if (closeIdx !== -1) memberEnd = closeIdx + 1;
+              } else if (vc === '"' || vc === "'" || vc === '`') {
+                // Find matching quote
+                for (let j = v + 1; j < len; j++) {
+                  if (text[j] === vc && !isEscapedAt(text, j)) { memberEnd = j + 1; break; }
+                }
+              } else {
+                // Scan to ',' or newline at depth 0
+                let depth = 0;
+                for (let j = v; j < len; j++) {
+                  const jc = text[j];
+                  if (jc === '(' || jc === '[' || jc === '{') depth++;
+                  else if (jc === ')' || jc === ']' || jc === '}') {
+                    if (depth === 0) { memberEnd = j; break; }
+                    depth--;
+                  } else if (depth === 0 && (jc === ',' || jc === '\n')) {
+                    memberEnd = j;
+                    break;
+                  }
+                }
+                if (memberEnd === -1) memberEnd = len;
+              }
+            }
+          } else if (p0 < len && text[p0] === '(') {
+            // Method/call pattern
+            const parenClose = findMatchForward(text, p0);
+            if (parenClose !== -1) {
+              // Check what follows the closing paren
+              let afterParen = parenClose + 1;
+              while (afterParen < len && (text[afterParen] === ' ' || text[afterParen] === '\t')) afterParen++;
+              if (afterParen < len && text[afterParen] === '{') {
+                // Method declaration: name(...) { ... }
+                const braceClose = findMatchForward(text, afterParen);
+                if (braceClose !== -1) memberEnd = braceClose + 1;
+              } else {
+                // Call expression: name(...)
+                memberEnd = parenClose + 1;
+              }
+            }
+          }
+
+          if (memberEnd !== -1) {
+            // 7. Include trailing ',' or ';'
+            if (memberEnd < len && (text[memberEnd] === ',' || text[memberEnd] === ';')) memberEnd++;
+            editor.selection = new vscode.Selection(doc.positionAt(exprStart), doc.positionAt(memberEnd));
+            return;
+          }
+        }
+      }
+
+      // --- Phase 0.5: Expand bracket selection to full member/call ---
+      // When the current selection starts at '{' or '(', expand backward to include the member signature or call chain.
+      // e.g. `{ ... },` → re-invoke → `cancelEdit(row) { ... },`
+      // e.g. `({...})` → re-invoke → `this.$message({...})`
+      if (L !== R && (text[L] === '{' || text[L] === '(')) {
+        let scanPos = L - 1;
+        // Skip whitespace before the bracket
+        while (scanPos >= 0 && (text[scanPos] === ' ' || text[scanPos] === '\t')) scanPos--;
+
+        let memberStart = -1;
+
+        // Helper: find chain start and async/await from a position on the last word char
+        const findChainStart = (p: number): number => {
+          let chainStart = p;
+          while (chainStart > 0 && isWordChar(text[chainStart - 1])) chainStart--;
+          // Extend left through '.' + word
+          while (chainStart > 0 && text[chainStart - 1] === '.') {
+            let wStart = chainStart - 2;
+            while (wStart >= 0 && isWordChar(text[wStart])) wStart--;
+            wStart++;
+            if (wStart < chainStart - 1) { chainStart = wStart; } else break;
+          }
+          let result = chainStart;
+          // Check for async/await keyword before the chain
+          let kwScan = chainStart - 1;
+          while (kwScan >= 0 && (text[kwScan] === ' ' || text[kwScan] === '\t')) kwScan--;
+          for (const kw of ['async', 'await']) {
+            const kwStart = kwScan - kw.length + 1;
+            if (kwStart >= 0 && text.substring(kwStart, kwScan + 1) === kw) {
+              if (kwStart === 0 || !isWordChar(text[kwStart - 1])) {
+                result = kwStart;
+                break;
+              }
+            }
+          }
+          return result;
+        };
+
+        if (text[L] === '(') {
+          // Call expression: expand (...) to name(...)
+          // Find the word/chain directly before '('
+          if (scanPos >= 0 && isWordChar(text[scanPos])) {
+            memberStart = findChainStart(scanPos);
+          }
+        } else {
+          // text[L] === '{'
+          if (scanPos >= 0 && text[scanPos] === ')') {
+            // Method pattern: name(...) { ... }
+            // Find matching '(' scanning backward
+            let depth = 0;
+            let parenOpen = -1;
+            for (let i = scanPos; i >= 0; i--) {
+              if (text[i] === ')') depth++;
+              else if (text[i] === '(') {
+                depth--;
+                if (depth === 0) { parenOpen = i; break; }
+              }
+            }
+            if (parenOpen > 0) {
+              let p = parenOpen - 1;
+              while (p >= 0 && (text[p] === ' ' || text[p] === '\t')) p--;
+              if (p >= 0 && isWordChar(text[p])) {
+                memberStart = findChainStart(p);
+              }
+            }
+          }
+        }
+
+        if (memberStart !== -1) {
+          editor.selection = new vscode.Selection(doc.positionAt(memberStart), doc.positionAt(R));
+          return;
+        }
+      }
+
       if (L !== R) { L--; R++; }
 
       // --- 1. Bracket scan (stack-based, handles nesting) ---
