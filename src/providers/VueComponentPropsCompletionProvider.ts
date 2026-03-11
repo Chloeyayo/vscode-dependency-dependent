@@ -18,12 +18,14 @@ function hashContent(content: string): number {
 }
 
 /**
- * Convert kebab-case or camelCase tag name to PascalCase
+ * Convert kebab-case / snake_case / camelCase tag name to PascalCase
  */
 function toPascalCase(name: string): string {
     return name
-        .replace(/-(\w)/g, (_, c) => c.toUpperCase())
-        .replace(/^[a-z]/, (c) => c.toUpperCase());
+        .split(/[-_]+/g)
+        .filter(Boolean)
+        .map((seg) => seg.charAt(0).toUpperCase() + seg.slice(1))
+        .join('');
 }
 
 /**
@@ -120,9 +122,9 @@ export class VueComponentPropsCompletionProvider implements vscode.CompletionIte
         // Find import path for this component in the current file
         let importPath: string | null = null;
         try {
-            importPath = await this.treeSitterParser.findImportPathForIdentifier(text, document.uri.fsPath, pascalName);
+            importPath = await this.treeSitterParser.findImportPathForComponentTag(text, document.uri.fsPath, tagName);
         } catch (e) {
-            log.appendLine(`VueComponentPropsCompletionProvider: findImportPathForIdentifier error: ${e}`);
+            log.appendLine(`VueComponentPropsCompletionProvider: findImportPathForComponentTag error: ${e}`);
         }
 
         if (!importPath) return null;
