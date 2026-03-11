@@ -117,6 +117,11 @@
           "command": "dependency-dependent.vueTimeline.trackVariable",
           "when": "editorLangId == vue",
           "group": "navigation@100"
+        },
+        {
+          "command": "dependency-dependent.vue.jumpToTemplateComponentTag",
+          "when": "editorLangId == vue",
+          "group": "navigation@101"
         }
       ],
       "view/title": [
@@ -152,6 +157,10 @@
       "commandPalette": [
         {
           "command": "dependency-dependent.vueTimeline.trackVariable",
+          "when": "editorLangId == vue"
+        },
+        {
+          "command": "dependency-dependent.vue.jumpToTemplateComponentTag",
           "when": "editorLangId == vue"
         },
         {
@@ -193,6 +202,11 @@
         "command": "dependency-dependent.vueTimeline.exitTrackingMode",
         "title": "Exit Variable Tracking",
         "icon": "$(close)",
+        "category": "Dependency & Dependent"
+      },
+      {
+        "command": "dependency-dependent.vue.jumpToTemplateComponentTag",
+        "title": "跳转到模板中的组件标签",
         "category": "Dependency & Dependent"
       },
       {

@@ -2,6 +2,7 @@ import * as path from "path";
 import * as vscode from "vscode";
 import { DepService } from "./DepService";
 import configWebpack from "./commands/configWebpack";
+import jumpToTemplateComponentTag from "./commands/jumpToTemplateComponentTag";
 import { getLoading, getLocked, setLoading, setLocked } from "./core/context";
 import { debounce } from "./core/debounce";
 import { computeFuncEnhance } from "./core/funcEnhance";
@@ -549,6 +550,14 @@ export function activate(context: vscode.ExtensionContext) {
               vueTimelineProvider.exitTrackingMode();
           }
       )
+  );
+
+  // --- Vue：从 import 跳转到 <template> 中的组件标签 ---
+  context.subscriptions.push(
+    vscode.commands.registerCommand(
+      "dependency-dependent.vue.jumpToTemplateComponentTag",
+      () => jumpToTemplateComponentTag()
+    )
   );
 
   // --- Func Enhance (Alt+Enter) ---

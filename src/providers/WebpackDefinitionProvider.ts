@@ -4,6 +4,7 @@ import * as fs from "fs";
 import { ResolverFactory, CachedInputFileSystem } from "enhanced-resolve";
 import { DepService } from "../DepService";
 import { TreeSitterParser } from "../core/TreeSitterParser";
+import { isOffsetInsideRootTemplate } from "../core/vueTemplateUtils";
 
 import { log } from "../extension";
 
@@ -42,35 +43,31 @@ export class WebpackDefinitionProvider implements vscode.DefinitionProvider {
       log.appendLine(`TreeSitter findImportSourceAtPosition error: ${e}`);
     }
 
-    // Strategy 2: If not in quotes, check if it's a Vue component tag
-    if (!request) {
-      // Allow words with hyphens (kebab-case)
+    // Strategy 2: 仅在 Vue 根级 <template> 内，把组件标签名映射到当前文件的 import 路径
+    if (
+      !request &&
+      document.languageId === "vue" &&
+      isOffsetInsideRootTemplate(fileContent, offset)
+    ) {
+      // 允许带 `-/_` 的标签名（kebab-case / snake_case）
       const range = document.getWordRangeAtPosition(position, /[\w-]+/);
       if (range) {
         const word = document.getText(range);
 
-        // Check if it looks like a component tag (kebab-case or PascalCase)
-        // Must start with a letter.
+        // 组件标签名必须以字母开头
         if (/^[a-zA-Z][\w-]*$/.test(word)) {
-          // Convert kebab-case to PascalCase
-          // e.g. operation-dialog -> OperationDialog
-          // e.g. MyComponent -> MyComponent
-          const pascalCase = word
-            .replace(/-(\w)/g, (_, c) => c.toUpperCase())
-            .replace(/^[a-z]/, (c) => c.toUpperCase());
-
-          // Find import for this component using TreeSitter
+          // 使用 TreeSitter：把标签名映射到当前文件的 import（兼容 my-com / my_com / mycom / MyCom 等）
           try {
-            const importPath = await this.treeSitterParser.findImportPathForIdentifier(
+            const importPath = await this.treeSitterParser.findImportPathForComponentTag(
               fileContent,
               filePath,
-              pascalCase
+              word
             );
             if (importPath) {
               request = importPath;
             }
           } catch (e) {
-            log.appendLine(`TreeSitter findImportPathForIdentifier error: ${e}`);
+            log.appendLine(`TreeSitter findImportPathForComponentTag error: ${e}`);
           }
         }
       }

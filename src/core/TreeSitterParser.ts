@@ -1085,6 +1085,245 @@ export class TreeSitterParser {
         return null;
     }
 
+    /**
+     * 在光标所在位置解析 import 语句，返回该 import 的本地绑定名列表。
+     * - 如果光标正好落在某个导入标识符上，preferredLocalName 会尽量指向“本地可用名称”（考虑 as 别名）。
+     * - 如果光标不在具体标识符上，则会按优先级选择默认导入 > namespace 导入 > 单个 named 导入。
+     */
+    public async getImportLocalNamesAtPosition(
+        content: string,
+        filePath: string,
+        offset: number
+    ): Promise<{ preferredLocalName: string | null; localNames: string[] } | null> {
+        const langId = this.getLangId(filePath);
+        if (!langId) return null;
+
+        if (langId === 'vue') {
+            const scriptInfo = this.extractVueScriptInfo(content);
+            if (!scriptInfo) return null;
+
+            const { scriptContent, scriptOffset } = scriptInfo;
+            if (offset < scriptOffset || offset >= scriptOffset + scriptContent.length) {
+                return null;
+            }
+
+            const relativeOffset = offset - scriptOffset;
+            return this.getImportLocalNamesAtPosition(scriptContent, 'temp.ts', relativeOffset);
+        }
+
+        if (content.length === 0) return null;
+        const safeOffset = Math.min(Math.max(0, offset), content.length - 1);
+
+        const tree = await this.parseWithCache(langId, content);
+        if (!tree) return null;
+
+        const cursorNode = tree.rootNode.descendantForIndex(safeOffset);
+        if (!cursorNode) return null;
+
+        let importStmt: any = cursorNode;
+        while (importStmt && importStmt.type !== 'import_statement') {
+            importStmt = importStmt.parent;
+        }
+        if (!importStmt) return null;
+
+        const importClause =
+            importStmt.children?.find((c: any) => c?.type === 'import_clause') ||
+            importStmt.namedChildren?.find((c: any) => c?.type === 'import_clause');
+        if (!importClause) return null;
+
+        let defaultLocal: string | null = null;
+        let namespaceLocal: string | null = null;
+        const namedLocals: string[] = [];
+
+        for (const child of importClause.children || []) {
+            if (!child) continue;
+
+            if (child.type === 'identifier') {
+                defaultLocal = child.text;
+                continue;
+            }
+
+            if (child.type === 'namespace_import') {
+                const id = (child.children || []).find((c: any) => c?.type === 'identifier');
+                if (id?.text) {
+                    namespaceLocal = id.text;
+                }
+                continue;
+            }
+
+            if (child.type === 'named_imports') {
+                for (const spec of child.children || []) {
+                    if (!spec || spec.type !== 'import_specifier') continue;
+                    const aliasNode = spec.childForFieldName('alias');
+                    const nameNode = spec.childForFieldName('name');
+                    const local = aliasNode?.text || nameNode?.text;
+                    if (local) {
+                        namedLocals.push(local);
+                    }
+                }
+            }
+        }
+
+        const localNames = [defaultLocal, namespaceLocal, ...namedLocals].filter(
+            (x): x is string => Boolean(x)
+        );
+        if (localNames.length === 0) return null;
+
+        // 去重（保持顺序）
+        const uniqueLocalNames: string[] = [];
+        const seen = new Set<string>();
+        for (const n of localNames) {
+            if (seen.has(n)) continue;
+            seen.add(n);
+            uniqueLocalNames.push(n);
+        }
+
+        // preferred：如果光标落在 import 的 identifier 上，优先选择其“本地可用名”
+        let preferredLocalName: string | null = null;
+        let idNode: any = cursorNode;
+        while (idNode && idNode !== importStmt) {
+            if (idNode.type === 'identifier') break;
+            idNode = idNode.parent;
+        }
+
+        if (idNode?.type === 'identifier') {
+            const parent = idNode.parent;
+            if (parent?.type === 'import_specifier') {
+                const aliasNode = parent.childForFieldName('alias');
+                const nameNode = parent.childForFieldName('name');
+                preferredLocalName = aliasNode?.text || nameNode?.text || idNode.text;
+            } else {
+                preferredLocalName = idNode.text;
+            }
+        } else {
+            // 光标不在具体标识符上：按“更像组件导入”的优先级挑一个
+            preferredLocalName =
+                defaultLocal ||
+                namespaceLocal ||
+                (namedLocals.length === 1 ? namedLocals[0] : null);
+        }
+
+        return { preferredLocalName, localNames: uniqueLocalNames };
+    }
+
+    /**
+     * 归一化组件名：用于把模板标签名与导入标识符做“弱匹配”。
+     * - 去掉 `-` / `_` 分隔符
+     * - 转小写
+     */
+    private normalizeComponentName(name: string): string {
+        return name.replace(/[-_]/g, '').toLowerCase();
+    }
+
+    /**
+     * 把标签名转成 PascalCase（kebab/snake/camel/Pascal 都可）。
+     * 仅用于优先级匹配（不作为最终唯一依据）。
+     */
+    private toPascalCaseFromTagName(name: string): string {
+        return name
+            .split(/[-_]+/g)
+            .filter(Boolean)
+            .map((seg) => seg.charAt(0).toUpperCase() + seg.slice(1))
+            .join('');
+    }
+
+    /**
+     * 根据 Vue 模板中的组件标签名（如 `my-com` / `my_com` / `mycom` / `MyCom`），
+     * 在当前文件的 import 列表中找到对应的 source 路径。
+     *
+     * 规则：
+     * 1) 先尝试精确匹配（tagName 原样、以及 tagName 转 PascalCase）
+     * 2) 再做归一化弱匹配：去掉 `-/_` 并忽略大小写
+     *
+     * 说明：Vue 2 模板里 `MyCom` 与 `my-com` 语义等价，但用户可能写出更多变体；
+     * 这里用归一化匹配尽量覆盖各种写法。
+     */
+    public async findImportPathForComponentTag(
+        content: string,
+        filePath: string,
+        tagName: string
+    ): Promise<string | null> {
+        if (!tagName) return null;
+
+        const langId = this.getLangId(filePath);
+        if (!langId) return null;
+
+        if (langId === 'vue') {
+            const scriptInfo = this.extractVueScriptInfo(content);
+            if (!scriptInfo) return null;
+            return this.findImportPathForComponentTag(
+                scriptInfo.scriptContent,
+                'temp.ts',
+                tagName
+            );
+        }
+
+        const tree = await this.parseWithCache(langId, content);
+        if (!tree) return null;
+
+        const query = this.getIdentifierImportQuery(langId);
+        if (!query) return null;
+
+        let matches: any[];
+        try {
+            matches = query.matches(tree.rootNode);
+        } catch {
+            // web-tree-sitter marshalNode 可能在某些 AST 上抛错，这里做降级处理
+            return null;
+        }
+
+        const tagPascal = this.toPascalCaseFromTagName(tagName);
+        const tagNormalized = this.normalizeComponentName(tagName);
+
+        let fallback: string | null = null;
+
+        for (const match of matches) {
+            let sourcePath: string | null = null;
+
+            for (const capture of match.captures) {
+                if (capture.name === 'source' && capture.node) {
+                    const text = capture.node.text;
+                    if (text.length >= 2) {
+                        sourcePath = text.substring(1, text.length - 1);
+                    }
+                }
+            }
+
+            if (!sourcePath) continue;
+
+            for (const capture of match.captures) {
+                if (!capture.node) continue;
+                if (capture.name !== 'default_import' && capture.name !== 'named_import') {
+                    continue;
+                }
+
+                let localName = capture.node.text;
+
+                // 处理 import { Foo as Bar } from '...'
+                // query 捕获的是 name(Foo)，但本地可用标识符是 alias(Bar)。
+                if (capture.name === 'named_import') {
+                    const specifierNode = capture.node.parent;
+                    const aliasNode = specifierNode?.childForFieldName('alias');
+                    if (aliasNode?.text) {
+                        localName = aliasNode.text;
+                    }
+                }
+
+                // ✅ 优先精确匹配（原样 / PascalCase）
+                if (localName === tagName || localName === tagPascal) {
+                    return sourcePath;
+                }
+
+                // ✅ 弱匹配（去分隔符 + 忽略大小写）
+                if (this.normalizeComponentName(localName) === tagNormalized) {
+                    fallback = fallback ?? sourcePath;
+                }
+            }
+        }
+
+        return fallback;
+    }
+
     public async findImportPathForIdentifier(
         content: string,
         filePath: string,
