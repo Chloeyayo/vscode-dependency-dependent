@@ -370,9 +370,15 @@ function init(modules: { typescript: typeof import("typescript/lib/tsserverlibra
         const snap = origGetScriptSnapshot(fileName);
         if (!snap) return origGetScriptVersion(fileName);
 
-        const text = snap.getText(0, snap.getLength());
-        const contentHash =
-          text.length + ":" + text.slice(0, 100) + text.slice(-100);
+        // 性能关键：getScriptVersion 可能被频繁调用。
+        // 这里不要读取整个文件内容（会产生巨大字符串分配并拖慢/拖挂 tsserver），
+        // 只取长度 + 头尾片段作为指纹（与之前 text.length + slice(0,100) + slice(-100) 的语义一致）。
+        const len = snap.getLength();
+        const headEnd = Math.min(100, len);
+        const tailStart = Math.max(0, len - 100);
+        const head = snap.getText(0, headEnd);
+        const tail = snap.getText(tailStart, len);
+        const contentHash = len + ":" + head + tail;
 
         const prev = vueContentVersions.get(fileName);
         if (prev && prev.contentHash === contentHash) {
