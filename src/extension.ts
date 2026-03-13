@@ -85,6 +85,26 @@ export function activate(context: vscode.ExtensionContext) {
   log.appendLine("Extension activating...");
   setContext(context);
 
+  // 拉起 TypeScript 语言服务并注册插件
+  const activateTSPlugin = async () => {
+    try {
+      const tsExt = vscode.extensions.getExtension('vscode.typescript-language-features');
+      if (!tsExt) return;
+
+      await tsExt.activate();
+      const api = tsExt.exports?.getAPI?.(0);
+      if (api) {
+        api.configurePlugin('dependency-dependent-ts-plugin', {});
+        log.appendLine('[TS] Plugin successfully configured.');
+      }
+    } catch (e: any) {
+      log.appendLine(`[TS] Error activating TS extension: ${e?.message || e}`);
+    }
+  };
+
+  // 立即触发（因为是在 onLanguage:vue 被激活，所以此时环境已经就绪）
+  activateTSPlugin();
+
   // Initialize TreeSitterParser with correct extension path
   // Try src/grammars first (dev mode), fall back to grammars/ (packaged extension)
   const srcGrammars = path.join(context.extensionPath, 'src', 'grammars');
