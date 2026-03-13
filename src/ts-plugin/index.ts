@@ -37,7 +37,7 @@ function init(modules: { typescript: typeof import("typescript/lib/tsserverlibra
     // ------------------------------------------------------------------ //
 
     function isVueFile(fileName: string): boolean {
-      return fileName.endsWith(".vue");
+      return fileName.toLowerCase().endsWith(".vue");
     }
 
     function isNodeModulesFile(fileName: string): boolean {
@@ -367,8 +367,9 @@ function init(modules: { typescript: typeof import("typescript/lib/tsserverlibra
 
     host.getScriptVersion = (fileName: string) => {
       if (isVueFile(fileName)) {
+        const baseVersion = origGetScriptVersion(fileName);
         const snap = origGetScriptSnapshot(fileName);
-        if (!snap) return origGetScriptVersion(fileName);
+        if (!snap) return `vue:${baseVersion}`;
 
         // 性能关键：getScriptVersion 可能被频繁调用。
         // 这里不要读取整个文件内容（会产生巨大字符串分配并拖慢/拖挂 tsserver），
@@ -378,16 +379,19 @@ function init(modules: { typescript: typeof import("typescript/lib/tsserverlibra
         const tailStart = Math.max(0, len - 100);
         const head = snap.getText(0, headEnd);
         const tail = snap.getText(tailStart, len);
-        const contentHash = len + ":" + head + tail;
+        // 加入宿主原始版本号，优先避免“中间改动但头尾不变”导致的误判。
+        const contentHash = baseVersion + "|" + len + ":" + head + tail;
 
         const prev = vueContentVersions.get(fileName);
         if (prev && prev.contentHash === contentHash) {
-          return String(prev.version);
+          // ⚠️ 必须加前缀：避免与宿主原始 version（通常是 "1"/"2"...）碰撞，
+          // 否则在插件初始化较晚时可能复用到“未 padding 的旧快照”，导致 <template> 被当成 JS/TS 解析。
+          return `vue:${prev.version}`;
         }
 
         const newVersion = prev ? prev.version + 1 : 1;
         vueContentVersions.set(fileName, { contentHash, version: newVersion });
-        return String(newVersion);
+        return `vue:${newVersion}`;
       }
       return origGetScriptVersion(fileName);
     };
@@ -427,6 +431,56 @@ function init(modules: { typescript: typeof import("typescript/lib/tsserverlibra
     function backPos(pos: number, ext: ExtractedScript): number {
       if (!ext.wrapInfo) return pos;
       return toOriginal(pos, ext.wrapInfo, ext.originalContent.length);
+    }
+
+    function overlapsScript(
+      start: number,
+      length: number,
+      ext: ExtractedScript,
+    ): boolean {
+      const end = start + Math.max(0, length);
+      return end >= ext.scriptStart && start <= ext.scriptEnd;
+    }
+
+    function mapDiagnosticToVueScript(
+      diagnostic: ts.Diagnostic,
+      ext: ExtractedScript,
+    ): ts.DiagnosticWithLocation | null {
+      // 这些 diagnostics 来自 LanguageService，理论上都有 file/start/length；
+      // 这里做兜底防御，避免破坏返回类型。
+      if (!diagnostic.file || diagnostic.start === undefined) return null;
+
+      const length = diagnostic.length ?? 0;
+
+      // 如果做了 wrap，先过滤掉追加的 WRAP_FUNC_DECL 区域
+      if (ext.wrapInfo && diagnostic.start >= ext.wrapInfo.declStart) {
+        return null;
+      }
+
+      let mappedStart = diagnostic.start;
+      let mappedLength = length;
+
+      if (ext.wrapInfo) {
+        const span = spanToOriginal(
+          diagnostic.start,
+          length,
+          ext.wrapInfo,
+          ext.originalContent.length,
+        );
+        mappedStart = span.start;
+        mappedLength = span.length;
+      }
+
+      // 只保留落在 <script> 内容区域内的诊断（避免 <template>/<style> 被 TS 误报）
+      if (!overlapsScript(mappedStart, mappedLength, ext)) {
+        return null;
+      }
+
+      // 注意：diagnostic 可能不是普通对象，这里用 Object.assign 保留原字段
+      return Object.assign({}, diagnostic, {
+        start: mappedStart,
+        length: mappedLength,
+      }) as ts.DiagnosticWithLocation;
     }
 
     // -- Completions --------------------------------------------------
@@ -587,17 +641,44 @@ function init(modules: { typescript: typeof import("typescript/lib/tsserverlibra
     // -- Diagnostics --------------------------------------------------
 
     proxy.getSemanticDiagnostics = (fileName: string) => {
-      if (isVueFile(fileName) || isNodeModulesFile(fileName)) return [];
+      if (isNodeModulesFile(fileName)) return [];
+      if (isVueFile(fileName)) {
+        const ext = getExtracted(fileName);
+        if (ext.scriptStart === 0 && ext.scriptEnd === 0) return [];
+
+        const all = ls.getSemanticDiagnostics(fileName);
+        return all
+          .map((d) => mapDiagnosticToVueScript(d, ext))
+          .filter((d): d is ts.DiagnosticWithLocation => Boolean(d));
+      }
       return ls.getSemanticDiagnostics(fileName);
     };
 
     proxy.getSyntacticDiagnostics = (fileName: string) => {
-      if (isVueFile(fileName) || isNodeModulesFile(fileName)) return [];
+      if (isNodeModulesFile(fileName)) return [];
+      if (isVueFile(fileName)) {
+        const ext = getExtracted(fileName);
+        if (ext.scriptStart === 0 && ext.scriptEnd === 0) return [];
+
+        const all = ls.getSyntacticDiagnostics(fileName);
+        return all
+          .map((d) => mapDiagnosticToVueScript(d, ext))
+          .filter((d): d is ts.DiagnosticWithLocation => Boolean(d));
+      }
       return ls.getSyntacticDiagnostics(fileName);
     };
 
     proxy.getSuggestionDiagnostics = (fileName: string) => {
-      if (isVueFile(fileName) || isNodeModulesFile(fileName)) return [];
+      if (isNodeModulesFile(fileName)) return [];
+      if (isVueFile(fileName)) {
+        const ext = getExtracted(fileName);
+        if (ext.scriptStart === 0 && ext.scriptEnd === 0) return [];
+
+        const all = ls.getSuggestionDiagnostics(fileName);
+        return all
+          .map((d) => mapDiagnosticToVueScript(d, ext))
+          .filter((d): d is ts.DiagnosticWithLocation => Boolean(d));
+      }
       return ls.getSuggestionDiagnostics(fileName);
     };
 
