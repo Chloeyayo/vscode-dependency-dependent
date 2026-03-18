@@ -1925,4 +1925,59 @@ export class TreeSitterParser {
         // No components found — insert after the opening { of the export default object
         return { type: 'new', insertOffset: objectNode.startIndex + 1 };
     }
+
+    /**
+     * Find insertion info for a Vue Options section (data / methods).
+     *
+     * Returns:
+     *  - type: 'existing' — section exists, insertOffset is before its closing }
+     *  - type: 'new' — section does not exist, insertOffset is after the opening { of export default {}
+     *  - null — no export default found
+     */
+    public async findOptionSectionInsertInfo(
+        scriptContent: string,
+        section: 'data' | 'methods'
+    ): Promise<{ type: 'existing' | 'new'; insertOffset: number; objectOpenOffset?: number } | null> {
+        const tree = await this.parseWithCache('typescript', scriptContent);
+        if (!tree) return null;
+
+        const root = tree.rootNode;
+        const exportStmt = this.findNodeByType(root, 'export_statement');
+        if (!exportStmt) return null;
+
+        const objectNode = this.findNodeByType(exportStmt, 'object');
+        if (!objectNode) return null;
+
+        for (const child of objectNode.children) {
+            if (child.type !== 'pair' && child.type !== 'method_definition') continue;
+
+            const keyNode = child.childForFieldName('key') || child.childForFieldName('name');
+            if (!keyNode || keyNode.text !== section) continue;
+
+            if (section === 'data') {
+                // data() { return { ... } }  — find the return object's closing }
+                const returnObj = this.findDataReturnObject(child);
+                if (returnObj) {
+                    return {
+                        type: 'existing',
+                        insertOffset: returnObj.endIndex - 1,
+                        objectOpenOffset: returnObj.startIndex + 1,
+                    };
+                }
+            } else {
+                // methods: { ... }  — find the value object's closing }
+                const valueNode = child.childForFieldName('value');
+                if (valueNode && valueNode.type === 'object') {
+                    return {
+                        type: 'existing',
+                        insertOffset: valueNode.endIndex - 1,
+                        objectOpenOffset: valueNode.startIndex + 1,
+                    };
+                }
+            }
+        }
+
+        // Section not found — insert after opening { of export default
+        return { type: 'new', insertOffset: objectNode.startIndex + 1 };
+    }
 }

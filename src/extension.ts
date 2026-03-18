@@ -6,6 +6,7 @@ import jumpToTemplateComponentTag from "./commands/jumpToTemplateComponentTag";
 import { getLoading, getLocked, setLoading, setLocked } from "./core/context";
 import { debounce } from "./core/debounce";
 import { computeFuncEnhance } from "./core/funcEnhance";
+import { generateVueOption } from "./core/vueOptionGenerate";
 import { reindentText } from "./core/indent";
 import { setContext } from "./share";
 import DepExplorerView from "./views/DepExplorerView";
@@ -859,6 +860,32 @@ export function activate(context: vscode.ExtensionContext) {
 
         const doc = editor.document;
         const pos = editor.selection.active;
+
+        // --- Vue Option Auto-Generate: try first for .vue files ---
+        if (doc.fileName.endsWith('.vue')) {
+          const tsParser = TreeSitterParser.getInstance();
+          const genResult = await generateVueOption(
+            doc.getText(),
+            doc.offsetAt(pos),
+            tsParser
+          );
+          if (genResult) {
+            const startPos = doc.positionAt(genResult.insertOffset);
+            if (genResult.replaceLength) {
+              const endPos = doc.positionAt(genResult.insertOffset + genResult.replaceLength);
+              await editor.edit(eb => eb.replace(new vscode.Range(startPos, endPos), genResult.insertText));
+            } else {
+              await editor.edit(eb => eb.insert(startPos, genResult.insertText));
+            }
+            const msg = vscode.window.setStatusBarMessage(
+              `$(check) Generated ${genResult.name} in ${genResult.section}`
+            );
+            setTimeout(() => msg.dispose(), 3000);
+            return;
+          }
+        }
+
+        // --- Original funcEnhance logic ---
         const lines = doc.getText().split('\n');
         const insertSpaces = editor.options.insertSpaces as boolean;
         const tabSizeNum = editor.options.tabSize as number;
