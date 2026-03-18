@@ -56,11 +56,34 @@ interface ComponentItemData {
     documentUri: string;
 }
 
+interface ComponentInfo {
+    uri: vscode.Uri;
+    componentName: string;    // PascalCase
+    kebabName: string;        // kebab-case
+    nameLower: string;        // lowercase for matching
+    kebabLower: string;       // lowercase kebab for matching
+}
+
 interface WorkspaceVueIndexState {
     files: Map<string, vscode.Uri>;
+    components: Map<string, ComponentInfo>;  // fsPath -> ComponentInfo
     initialized: boolean;
     initPromise?: Promise<void>;
     watcher: vscode.FileSystemWatcher;
+}
+
+function buildComponentInfo(fsPath: string, uri: vscode.Uri): ComponentInfo | null {
+    const componentName = fileNameToComponentName(fsPath);
+    if (!componentName) return null;
+    if (NATIVE_HTML_TAGS.has(componentName.toLowerCase())) return null;
+    const kebabName = toKebabCase(componentName);
+    return {
+        uri,
+        componentName,
+        kebabName,
+        nameLower: componentName.toLowerCase(),
+        kebabLower: kebabName.toLowerCase(),
+    };
 }
 
 export class VueComponentTagCompletionProvider
@@ -98,6 +121,7 @@ export class VueComponentTagCompletionProvider
 
         const state: WorkspaceVueIndexState = {
             files: new Map<string, vscode.Uri>(),
+            components: new Map<string, ComponentInfo>(),
             initialized: false,
             watcher,
         };
@@ -106,10 +130,15 @@ export class VueComponentTagCompletionProvider
             if (isIgnoredVueFile(uri)) return;
             const normalized = vscode.Uri.file(uri.fsPath).fsPath;
             state.files.set(normalized, uri);
+            const info = buildComponentInfo(normalized, uri);
+            if (info) {
+                state.components.set(normalized, info);
+            }
         });
         watcher.onDidDelete((uri) => {
             const normalized = vscode.Uri.file(uri.fsPath).fsPath;
             state.files.delete(normalized);
+            state.components.delete(normalized);
         });
         watcher.onDidChange((uri) => {
             if (isIgnoredVueFile(uri)) return;
@@ -144,6 +173,10 @@ export class VueComponentTagCompletionProvider
                 if (isIgnoredVueFile(file)) continue;
                 const normalized = vscode.Uri.file(file.fsPath).fsPath;
                 state.files.set(normalized, file);
+                const info = buildComponentInfo(normalized, file);
+                if (info) {
+                    state.components.set(normalized, info);
+                }
             }
             state.initialized = true;
         })().finally(() => {
@@ -153,7 +186,7 @@ export class VueComponentTagCompletionProvider
         return state.initPromise;
     }
 
-    private async getVueFiles(documentUri: vscode.Uri): Promise<vscode.Uri[]> {
+    private async getComponents(documentUri: vscode.Uri): Promise<ComponentInfo[]> {
         const workspace = vscode.workspace.getWorkspaceFolder(documentUri);
         if (!workspace) {
             return [];
@@ -161,7 +194,7 @@ export class VueComponentTagCompletionProvider
 
         const state = this.getWorkspaceState(workspace);
         await this.ensureWorkspaceIndexed(workspace, state);
-        return Array.from(state.files.values());
+        return Array.from(state.components.values());
     }
 
     async provideCompletionItems(
@@ -189,8 +222,7 @@ export class VueComponentTagCompletionProvider
         const replaceStart = new vscode.Position(position.line, position.character - partialName.length);
         const replaceRange = new vscode.Range(replaceStart, position);
 
-        // Find all .vue files in the workspace (indexed + watcher incremental updates)
-        const vueFiles = await this.getVueFiles(document.uri);
+        const components = await this.getComponents(document.uri);
         if (token.isCancellationRequested) return null;
 
         const currentFilePath = document.uri.fsPath;
@@ -204,45 +236,34 @@ export class VueComponentTagCompletionProvider
 
         const items: vscode.CompletionItem[] = [];
 
-        for (const fileUri of vueFiles) {
+        for (const comp of components) {
             if (token.isCancellationRequested) break;
 
-            const targetPath = fileUri.fsPath;
+            const targetPath = comp.uri.fsPath;
             if (targetPath === currentFilePath) continue;
 
-            const componentName = fileNameToComponentName(targetPath);
-            if (!componentName) continue;
-
-            // Skip native HTML names
-            if (NATIVE_HTML_TAGS.has(componentName.toLowerCase())) continue;
-
-            const kebabName = toKebabCase(componentName);
             if (partialLower.length > 0) {
-                const matchesPascal = componentName.toLowerCase().startsWith(partialLower);
-                const matchesKebab = kebabName.startsWith(partialLower);
-                if (!matchesPascal && !matchesKebab) {
+                if (!comp.nameLower.startsWith(partialLower) && !comp.kebabLower.startsWith(partialLower)) {
                     continue;
                 }
             }
 
-            // Show all components (including already-imported ones) — resolveCompletionItem
-            // will decide whether to add the import edit or not
-            const isAlreadyImported = importedNames.has(componentName);
+            const isAlreadyImported = importedNames.has(comp.componentName);
             const relPath = path.relative(workspaceRoot, targetPath).replace(/\\/g, '/');
 
-            const item = new vscode.CompletionItem(componentName, vscode.CompletionItemKind.Module);
+            const item = new vscode.CompletionItem(comp.componentName, vscode.CompletionItemKind.Module);
             item.detail = relPath;
-            item.filterText = componentName + ' ' + kebabName;
-            item.insertText = componentName;
+            item.filterText = comp.componentName + ' ' + comp.kebabName;
+            item.insertText = comp.componentName;
             item.range = replaceRange;
-            item.sortText = isAlreadyImported ? `1_${componentName}` : `5_${componentName}`;
+            item.sortText = isAlreadyImported ? `1_${comp.componentName}` : `5_${comp.componentName}`;
 
             if (!isAlreadyImported) {
                 item.documentation = new vscode.MarkdownString('Auto-import component');
                 // Store data for resolveCompletionItem
                 (item as any).data = {
                     targetPath,
-                    componentName,
+                    componentName: comp.componentName,
                     documentUri: document.uri.toString(),
                 } as ComponentItemData;
             }

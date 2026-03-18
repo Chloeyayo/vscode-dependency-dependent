@@ -27,7 +27,9 @@
   },
   "homepage": "https://github.com/zjffun/vscode-dependency-dependent#readme",
   "activationEvents": [
-    "onStartupFinished"
+    "onLanguage:vue",
+    "onView:dependency-dependent-DepExplorerView",
+    "onView:dependency-dependent-VueTimelineView"
   ],
   "main": "./dist/extension.js",
   "l10n": "./l10n",
@@ -80,6 +82,11 @@
           },
           "default": [],
           "description": "Custom Vue instance $xxx properties for this.$ completion (e.g. [\"$api\", \"$bus\"]). The $ prefix is auto-added if omitted."
+        },
+        "dependencyDependent.blockSelect.innerFirstChars": {
+          "type": "string",
+          "default": "'\"(`",
+          "description": "Block Select 中优先选中内容（不含分隔符）的符号集合。例如光标在 'str' 内时，第一次选中 str，第二次选中 'str'。"
         },
         "typescript-plugins.suggest.enabled": {
           "type": "boolean",

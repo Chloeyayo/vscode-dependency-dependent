@@ -1,3 +1,4 @@
+import * as path from "path";
 import type ts from "typescript/lib/tsserverlibrary";
 
 function init(modules: { typescript: typeof import("typescript/lib/tsserverlibrary") }) {
@@ -46,6 +47,290 @@ function init(modules: { typescript: typeof import("typescript/lib/tsserverlibra
 
     function padAll(s: string): string {
       return s.replace(/[^\n]/g, " ");
+    }
+
+    function getCurrentDirectory(): string {
+      try {
+        const cwd = host.getCurrentDirectory?.();
+        if (cwd) return cwd;
+      } catch {}
+      try {
+        const cwd = info.project.getCurrentDirectory?.();
+        if (cwd) return cwd;
+      } catch {}
+      return process.cwd();
+    }
+
+    function normalizePath(fileName: string): string {
+      return path.normalize(fileName);
+    }
+
+    function directoryExists(dirName: string): boolean {
+      try {
+        if (host.directoryExists) return host.directoryExists(dirName);
+      } catch {}
+      return ts.sys.directoryExists(dirName);
+    }
+
+    function fileExists(fileName: string): boolean {
+      try {
+        if (host.fileExists) return host.fileExists(fileName);
+      } catch {}
+      return ts.sys.fileExists(fileName);
+    }
+
+    function dedupePaths(paths: string[]): string[] {
+      const seen = new Set<string>();
+      const result: string[] = [];
+      for (const candidate of paths) {
+        const normalized = normalizePath(candidate);
+        if (!normalized || seen.has(normalized)) continue;
+        seen.add(normalized);
+        result.push(normalized);
+      }
+      return result;
+    }
+
+    const projectRootCache = new Map<string, string[]>();
+    const resolutionMissLogCache = new Set<string>();
+
+    function getConfiguredProjectRoot(): string | undefined {
+      try {
+        const projectName = info.project.getProjectName?.();
+        if (!projectName) return undefined;
+        const normalized = normalizePath(projectName);
+        if (/\.json$/i.test(normalized) && fileExists(normalized)) {
+          return normalizePath(path.dirname(normalized));
+        }
+        if (directoryExists(normalized)) {
+          return normalized;
+        }
+      } catch {}
+      return undefined;
+    }
+
+    function findNearestProjectRoot(startDir: string): string | undefined {
+      let current = normalizePath(startDir);
+      while (true) {
+        if (
+          fileExists(path.join(current, "tsconfig.json")) ||
+          fileExists(path.join(current, "jsconfig.json")) ||
+          fileExists(path.join(current, "package.json"))
+        ) {
+          return current;
+        }
+        const parent = path.dirname(current);
+        if (parent === current) return undefined;
+        current = parent;
+      }
+    }
+
+    function getProjectRoots(containingFile: string): string[] {
+      const cacheKey = normalizePath(path.dirname(containingFile));
+      const cached = projectRootCache.get(cacheKey);
+      if (cached) return cached;
+
+      const roots = dedupePaths([
+        getConfiguredProjectRoot() ?? "",
+        findNearestProjectRoot(path.dirname(containingFile)) ?? "",
+        getCurrentDirectory(),
+      ].filter(Boolean));
+
+      const result = roots.length > 0 ? roots : [cacheKey];
+      projectRootCache.set(cacheKey, result);
+      return result;
+    }
+
+    function getBaseDirectories(
+      containingFile: string,
+      compilerOptions: ts.CompilerOptions,
+    ): string[] {
+      const baseUrl = compilerOptions.baseUrl;
+      const projectRoots = getProjectRoots(containingFile);
+      if (!baseUrl) return projectRoots;
+      if (path.isAbsolute(baseUrl)) return [normalizePath(baseUrl)];
+      return dedupePaths(projectRoots.map((root) => path.resolve(root, baseUrl)));
+    }
+
+    function logResolutionMiss(
+      moduleName: string,
+      containingFile: string,
+      compilerOptions: ts.CompilerOptions,
+    ): void {
+      if (!moduleName.startsWith("@/") && !moduleName.endsWith(".vue")) return;
+      const key = `${normalizePath(containingFile)}::${moduleName}`;
+      if (resolutionMissLogCache.has(key)) return;
+      resolutionMissLogCache.add(key);
+      if (resolutionMissLogCache.size > 200) {
+        const oldest = resolutionMissLogCache.values().next().value;
+        if (oldest !== undefined) resolutionMissLogCache.delete(oldest);
+      }
+      logger.info(
+        `[vue-ts-plugin] resolve miss module=${moduleName} containing=${normalizePath(containingFile)} baseUrl=${compilerOptions.baseUrl ?? ""} projectRoots=${getProjectRoots(containingFile).join("|")}`,
+      );
+    }
+
+    function getPathPatternMatch(
+      pattern: string,
+      moduleName: string,
+    ): string | null {
+      const starIndex = pattern.indexOf("*");
+      if (starIndex < 0) return pattern === moduleName ? "" : null;
+
+      const prefix = pattern.slice(0, starIndex);
+      const suffix = pattern.slice(starIndex + 1);
+      if (!moduleName.startsWith(prefix) || !moduleName.endsWith(suffix)) {
+        return null;
+      }
+      return moduleName.slice(prefix.length, moduleName.length - suffix.length);
+    }
+
+    function applyPathPattern(pattern: string, starMatch: string): string {
+      return pattern.includes("*") ? pattern.replace("*", starMatch) : pattern;
+    }
+
+    function tryResolveVueFile(candidatePath: string): string | undefined {
+      const normalized = normalizePath(candidatePath);
+      const ext = path.extname(normalized).toLowerCase();
+
+      if (ext) {
+        if (ext !== ".vue") return undefined;
+        return fileExists(normalized) ? normalized : undefined;
+      }
+
+      const candidates = [
+        `${normalized}.vue`,
+        path.join(normalized, "index.vue"),
+      ];
+      for (const candidate of candidates) {
+        if (fileExists(candidate)) return normalizePath(candidate);
+      }
+      return undefined;
+    }
+
+    function tryResolveVueModuleByPaths(
+      moduleName: string,
+      containingFile: string,
+      compilerOptions: ts.CompilerOptions,
+    ): string | undefined {
+      const paths = compilerOptions.paths ?? {};
+      const baseDirectories = getBaseDirectories(containingFile, compilerOptions);
+
+      for (const baseDirectory of baseDirectories) {
+        for (const [pattern, replacements] of Object.entries(paths)) {
+          const starMatch = getPathPatternMatch(pattern, moduleName);
+          if (starMatch === null) continue;
+
+          for (const replacement of replacements) {
+            const mapped = applyPathPattern(replacement, starMatch);
+            const resolved = tryResolveVueFile(
+              path.resolve(baseDirectory, mapped),
+            );
+            if (resolved) return resolved;
+          }
+        }
+      }
+
+      for (const baseDirectory of baseDirectories) {
+        const resolved = tryResolveVueFile(path.resolve(baseDirectory, moduleName));
+        if (resolved) return resolved;
+      }
+      return undefined;
+    }
+
+    function tryResolveVueModuleManually(
+      moduleName: string,
+      containingFile: string,
+      compilerOptions: ts.CompilerOptions,
+    ): ts.ResolvedModuleFull | undefined {
+      let resolvedFileName: string | undefined;
+
+      if (moduleName.startsWith(".") || path.isAbsolute(moduleName)) {
+        resolvedFileName = tryResolveVueFile(
+          path.resolve(path.dirname(containingFile), moduleName),
+        );
+      } else {
+        resolvedFileName = tryResolveVueModuleByPaths(
+          moduleName,
+          containingFile,
+          compilerOptions,
+        );
+
+        // 与扩展其他模块保持一致：若用户未配置 paths/baseUrl，兜底支持 @ -> src。
+        if (!resolvedFileName && moduleName.startsWith("@/")) {
+          for (const projectRoot of getProjectRoots(containingFile)) {
+            resolvedFileName = tryResolveVueFile(
+              path.resolve(projectRoot, "src", moduleName.slice(2)),
+            );
+            if (resolvedFileName) break;
+          }
+        }
+      }
+
+      if (!resolvedFileName) return undefined;
+
+      return {
+        resolvedFileName,
+        extension: ts.Extension.Js,
+        isExternalLibraryImport: false,
+      } as ts.ResolvedModuleFull;
+    }
+
+    const VUE_RESOLUTION_CACHE_MAX = 500;
+    const vueResolutionCache = new Map<string, ts.ResolvedModuleFull>();
+
+    function getVueResolutionCacheKey(
+      moduleName: string,
+      containingFile: string,
+      compilerOptions: ts.CompilerOptions,
+    ): string {
+      return JSON.stringify({
+        moduleName,
+        containingFile: normalizePath(containingFile),
+        baseUrl: compilerOptions.baseUrl ?? "",
+        paths: compilerOptions.paths ?? {},
+      });
+    }
+
+    function getCachedVueResolution(
+      moduleName: string,
+      containingFile: string,
+      compilerOptions: ts.CompilerOptions,
+    ): ts.ResolvedModuleFull | undefined {
+      const key = getVueResolutionCacheKey(
+        moduleName,
+        containingFile,
+        compilerOptions,
+      );
+      const cached = vueResolutionCache.get(key);
+      if (!cached) return undefined;
+      if (!fileExists(cached.resolvedFileName)) {
+        vueResolutionCache.delete(key);
+        return undefined;
+      }
+      vueResolutionCache.delete(key);
+      vueResolutionCache.set(key, cached);
+      return cached;
+    }
+
+    function setCachedVueResolution(
+      moduleName: string,
+      containingFile: string,
+      compilerOptions: ts.CompilerOptions,
+      resolved: ts.ResolvedModuleFull,
+    ): void {
+      const key = getVueResolutionCacheKey(
+        moduleName,
+        containingFile,
+        compilerOptions,
+      );
+      vueResolutionCache.delete(key);
+      vueResolutionCache.set(key, resolved);
+      while (vueResolutionCache.size > VUE_RESOLUTION_CACHE_MAX) {
+        const oldest = vueResolutionCache.keys().next().value;
+        if (oldest === undefined) break;
+        vueResolutionCache.delete(oldest);
+      }
     }
 
     // ------------------------------------------------------------------ //
@@ -224,6 +509,14 @@ function init(modules: { typescript: typeof import("typescript/lib/tsserverlibra
         originalContent = before + body + after;
       }
 
+      // Inject // @ts-check into padded region so tsserver checks only .vue files
+      // (global checkJs is false). The padded area is all spaces, so overwriting
+      // the first 13 chars preserves total length and offset mapping.
+      const TS_CHECK = "// @ts-check\n";
+      if (scriptBodyStart >= TS_CHECK.length) {
+        originalContent = TS_CHECK + originalContent.slice(TS_CHECK.length);
+      }
+
       let content = originalContent;
       let wrapInfo: WrapInfo | null = null;
 
@@ -318,7 +611,7 @@ function init(modules: { typescript: typeof import("typescript/lib/tsserverlibra
       return {
         ...s,
         allowJs: true,
-        checkJs: true,
+        checkJs: false,
         noImplicitThis: true,
         noImplicitAny: false,
         strictNullChecks: false,
@@ -329,35 +622,124 @@ function init(modules: { typescript: typeof import("typescript/lib/tsserverlibra
       };
     };
 
-    // ✅ FIX 1：补全 resolveModuleNames
-    //
-    // tsserver 插件的 host 通常没有实现 resolveModuleNames，
-    // 导致 TypeScript 内部走"默认解析"，不认识 @/ 别名。
-    // 我们手动实现，用当前 compilerOptions（含 paths/baseUrl）调用
-    // ts.resolveModuleName，这样 @/ 就能正确解析。
-    if (!host.resolveModuleNames) {
-      host.resolveModuleNames = (
-        moduleNames: string[],
-        containingFile: string,
-        _reusedNames: string[] | undefined,
-        _redirectedReference: ts.ResolvedProjectReference | undefined,
-        compilerOptions: ts.CompilerOptions,
-      ): (ts.ResolvedModule | undefined)[] => {
-        return moduleNames.map((moduleName) => {
-          try {
-            const { resolvedModule } = ts.resolveModuleName(
-              moduleName,
-              containingFile,
-              compilerOptions,
-              host as ts.ModuleResolutionHost,
-            );
-            return resolvedModule;
-          } catch {
-            return undefined;
-          }
-        });
-      };
+    function resolveVueAwareModule(
+      moduleName: string,
+      containingFile: string,
+      compilerOptions: ts.CompilerOptions,
+      originalResolved?: ts.ResolvedModule | undefined,
+    ): ts.ResolvedModule | undefined {
+      if (originalResolved) return originalResolved;
+
+      // 命中过去已解析的 .vue 结果，直接短路，避免重复触发
+      // ts.resolveModuleName 的多轮磁盘探测。
+      const cachedResolved = getCachedVueResolution(
+        moduleName,
+        containingFile,
+        compilerOptions,
+      );
+      if (cachedResolved) return cachedResolved;
+
+      try {
+        const { resolvedModule } = ts.resolveModuleName(
+          moduleName,
+          containingFile,
+          compilerOptions,
+          host as ts.ModuleResolutionHost,
+        );
+        if (resolvedModule) return resolvedModule;
+      } catch {}
+
+      // 手动解析 .vue 目标：TS 原生 resolver 不识别 .vue 扩展，
+      // 这里补上 paths/baseUrl/@ 别名与 index.vue 探测。
+      const manualResolved = tryResolveVueModuleManually(
+        moduleName,
+        containingFile,
+        compilerOptions,
+      );
+      if (manualResolved) {
+        setCachedVueResolution(
+          moduleName,
+          containingFile,
+          compilerOptions,
+          manualResolved,
+        );
+        return manualResolved;
+      }
+
+      logResolutionMiss(moduleName, containingFile, compilerOptions);
+      return undefined;
     }
+
+    // ✅ 同时兼容 resolveModuleNames 与 resolveModuleNameLiterals。
+    // TypeScript 5.x 在很多路径上会优先走后者；只包前者会导致线上 tsserver
+    // 与本地 stub 行为不一致。
+    const origResolveModuleNames = host.resolveModuleNames?.bind(host);
+    host.resolveModuleNames = (
+      moduleNames: string[],
+      containingFile: string,
+      reusedNames: string[] | undefined,
+      redirectedReference: ts.ResolvedProjectReference | undefined,
+      compilerOptions: ts.CompilerOptions,
+      containingSourceFile?: ts.SourceFile,
+    ): (ts.ResolvedModule | undefined)[] => {
+      let origResults: (ts.ResolvedModule | undefined)[] | undefined;
+      if (origResolveModuleNames) {
+        try {
+          origResults = origResolveModuleNames(
+            moduleNames,
+            containingFile,
+            reusedNames,
+            redirectedReference,
+            compilerOptions,
+            containingSourceFile,
+          );
+        } catch {}
+      }
+      return moduleNames.map((moduleName, i) =>
+        resolveVueAwareModule(
+          moduleName,
+          containingFile,
+          compilerOptions,
+          origResults?.[i],
+        ),
+      );
+    };
+
+    const origResolveModuleNameLiterals =
+      host.resolveModuleNameLiterals?.bind(host);
+    host.resolveModuleNameLiterals = (
+      moduleLiterals: readonly ts.StringLiteralLike[],
+      containingFile: string,
+      redirectedReference: ts.ResolvedProjectReference | undefined,
+      compilerOptions: ts.CompilerOptions,
+      containingSourceFile: ts.SourceFile,
+      reusedNames: readonly ts.StringLiteralLike[] | undefined,
+    ): readonly ts.ResolvedModuleWithFailedLookupLocations[] => {
+      let origResults:
+        | readonly ts.ResolvedModuleWithFailedLookupLocations[]
+        | undefined;
+      if (origResolveModuleNameLiterals) {
+        try {
+          origResults = origResolveModuleNameLiterals(
+            moduleLiterals,
+            containingFile,
+            redirectedReference,
+            compilerOptions,
+            containingSourceFile,
+            reusedNames,
+          );
+        } catch {}
+      }
+
+      return moduleLiterals.map((moduleLiteral, i) => ({
+        resolvedModule: resolveVueAwareModule(
+          moduleLiteral.text,
+          containingFile,
+          compilerOptions,
+          origResults?.[i]?.resolvedModule,
+        ) as ts.ResolvedModuleFull | undefined,
+      }));
+    };
 
     const origGetScriptVersion = host.getScriptVersion.bind(host);
     const vueContentVersions = new Map<
@@ -638,6 +1020,61 @@ function init(modules: { typescript: typeof import("typescript/lib/tsserverlibra
       return ls.getDefinitionAndBoundSpan(fileName, position);
     };
 
+    // -- Document Highlights ------------------------------------------
+
+    proxy.getDocumentHighlights = (
+      fileName: string,
+      position: number,
+      filesToSearch: string[],
+    ) => {
+      if (isVueFile(fileName)) {
+        const ext = getExtracted(fileName);
+        const { wrapInfo } = ext;
+
+        const mapped = wrapInfo ? toModified(position, wrapInfo) : position;
+        const result = ls.getDocumentHighlights(fileName, mapped, filesToSearch);
+
+        if (!result || !wrapInfo) {
+          return result;
+        }
+
+        return result
+          .map((highlight) => {
+            if (!isVueFile(highlight.fileName)) {
+              return highlight;
+            }
+
+            const targetExt =
+              highlight.fileName === fileName
+                ? ext
+                : getExtracted(highlight.fileName);
+
+            if (!targetExt.wrapInfo) {
+              return highlight;
+            }
+
+            const highlightSpans = highlight.highlightSpans
+              .map((span) => {
+                const orig = backSpan(span.textSpan.start, span.textSpan.length, targetExt);
+                if (orig.length <= 0) return null;
+                return {
+                  ...span,
+                  textSpan: { start: orig.start, length: orig.length },
+                };
+              })
+              .filter((span): span is ts.HighlightSpan => Boolean(span));
+
+            return {
+              ...highlight,
+              highlightSpans,
+            };
+          })
+          .filter((highlight) => highlight.highlightSpans.length > 0);
+      }
+
+      return ls.getDocumentHighlights(fileName, position, filesToSearch);
+    };
+
     // -- Diagnostics --------------------------------------------------
 
     proxy.getSemanticDiagnostics = (fileName: string) => {
@@ -794,12 +1231,93 @@ function init(modules: { typescript: typeof import("typescript/lib/tsserverlibra
       return ls.getSignatureHelpItems(fileName, position, options);
     };
 
+    // -- Code Fix / Refactor ------------------------------------------
+    //
+    // TypeScript 5.9 对我们这种“padding + wrap”的虚拟 JS 视图在 code fix/refactor
+    // 路径上并不稳定，继续放行会直接把 semantic tsserver 打崩。
+    // 这里先对 .vue 做保守降级：保留诊断、跳转、补全，关闭易崩的自动修复/重构。
+
+    proxy.getCodeFixesAtPosition = (
+      fileName: string,
+      start: number,
+      end: number,
+      errorCodes: readonly number[],
+      formatOptions: ts.FormatCodeSettings,
+      preferences: ts.UserPreferences,
+    ) => {
+      if (isVueFile(fileName)) return [];
+      return ls.getCodeFixesAtPosition(
+        fileName,
+        start,
+        end,
+        errorCodes,
+        formatOptions,
+        preferences,
+      );
+    };
+
+    proxy.getCombinedCodeFix = (
+      scope: ts.CombinedCodeFixScope,
+      fixId: {},
+      formatOptions: ts.FormatCodeSettings,
+      preferences: ts.UserPreferences,
+    ) => {
+      if ("fileName" in scope && isVueFile(scope.fileName)) {
+        return { changes: [], commands: undefined };
+      }
+      return ls.getCombinedCodeFix(scope, fixId, formatOptions, preferences);
+    };
+
+    proxy.getApplicableRefactors = (
+      fileName: string,
+      positionOrRange: number | ts.TextRange,
+      preferences: ts.UserPreferences | undefined,
+      triggerReason?: ts.RefactorTriggerReason,
+      kind?: string,
+      includeInteractiveActions?: boolean,
+    ) => {
+      if (isVueFile(fileName)) return [];
+      return ls.getApplicableRefactors(
+        fileName,
+        positionOrRange,
+        preferences,
+        triggerReason,
+        kind,
+        includeInteractiveActions,
+      );
+    };
+
+    proxy.getEditsForRefactor = (
+      fileName: string,
+      formatOptions: ts.FormatCodeSettings,
+      positionOrRange: number | ts.TextRange,
+      refactorName: string,
+      actionName: string,
+      preferences: ts.UserPreferences | undefined,
+      interactiveRefactorArguments?: ts.InteractiveRefactorArguments,
+    ) => {
+      if (isVueFile(fileName)) return undefined;
+      return ls.getEditsForRefactor(
+        fileName,
+        formatOptions,
+        positionOrRange,
+        refactorName,
+        actionName,
+        preferences,
+        interactiveRefactorArguments,
+      );
+    };
+
     logger.info("[vue-ts-plugin] ready");
     return proxy;
   }
 
   function getExternalFiles(project: ts.server.Project): string[] {
-    return project.getFileNames().filter((f) => f.endsWith(".vue"));
+    try {
+      return project.getRootFiles().filter((f) => f.endsWith(".vue"));
+    } catch {
+      return [];
+    }
   }
 
   return { create, getExternalFiles };

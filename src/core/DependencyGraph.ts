@@ -98,7 +98,7 @@ export class DependencyGraph {
    * Full initialization: scan all entry-point files and build the graph.
    * Shows progress in the VS Code window.
    */
-  async initialize(entryPatterns: string[], excludes: string[]): Promise<void> {
+  async initialize(entryPatterns: string[], excludes: string[], token?: { isCancellationRequested: boolean }): Promise<void> {
     if (this.initialized) {
       return;
     }
@@ -109,7 +109,7 @@ export class DependencyGraph {
 
     this.initPromise = (async () => {
       try {
-        await this._doInitialize(entryPatterns, excludes);
+        await this._doInitialize(entryPatterns, excludes, token);
         this.initialized = true;
       } catch (e) {
         this.initialized = false;
@@ -122,7 +122,7 @@ export class DependencyGraph {
     return this.initPromise;
   }
 
-  private async _doInitialize(entryPatterns: string[], excludes: string[]): Promise<void> {
+  private async _doInitialize(entryPatterns: string[], excludes: string[], token?: { isCancellationRequested: boolean }): Promise<void> {
     await this.initResolver();
 
     // Discover all files matching entry patterns
@@ -142,9 +142,13 @@ export class DependencyGraph {
     );
 
     // Parse each file (parallel with concurrency limit)
-    const CONCURRENCY = 10;
+    const CONCURRENCY = 50;
     let processed = 0;
     for (let i = 0; i < allFiles.length; i += CONCURRENCY) {
+      if (token?.isCancellationRequested) {
+        log.appendLine(`DependencyGraph: Initialization cancelled at ${processed}/${allFiles.length}`);
+        return;
+      }
       const batch = allFiles.slice(i, i + CONCURRENCY);
       await Promise.all(batch.map((filePath) => this.processFile(filePath)));
       processed += batch.length;

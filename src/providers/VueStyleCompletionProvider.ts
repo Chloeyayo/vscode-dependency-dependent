@@ -12,11 +12,11 @@ import {
 } from "vscode-css-languageservice";
 import { InsertReplaceEdit } from "vscode-languageserver-types";
 
-interface CachedStylesheet {
+interface CachedRegions {
   uri: string;
   version: number;
-  langId: string;
-  stylesheet: Stylesheet;
+  regions: StyleRegion[];
+  lineRanges: { startLine: number; endLine: number }[];
 }
 
 /**
@@ -81,16 +81,13 @@ function mapCompletionItemKind(
 export class VueStyleCompletionProvider
   implements vscode.CompletionItemProvider
 {
-  private cssLS: CSSLanguageService;
-  private scssLS: CSSLanguageService;
-  private lessLS: CSSLanguageService;
-  private cache: CachedStylesheet | null = null;
-
-  constructor() {
-    this.cssLS = getCSSLanguageService();
-    this.scssLS = getSCSSLanguageService();
-    this.lessLS = getLESSLanguageService();
-  }
+  private _cssLS?: CSSLanguageService;
+  private _scssLS?: CSSLanguageService;
+  private _lessLS?: CSSLanguageService;
+  private stylesheetCache = new Map<string, Stylesheet>();
+  private lastCacheVersion = -1;
+  private lastCacheUri = "";
+  private regionCache: CachedRegions | null = null;
 
   async provideCompletionItems(
     document: vscode.TextDocument,
@@ -100,11 +97,22 @@ export class VueStyleCompletionProvider
   ): Promise<vscode.CompletionList | null> {
     if (!document.fileName.endsWith(".vue")) return null;
 
+    const uri = document.uri.toString();
+    const version = document.version;
+
+    // Fast line-range pre-check: skip getText() when cursor is outside all <style> blocks
+    const cached = this.regionCache;
+    if (cached && cached.uri === uri && cached.version === version) {
+      if (!cached.lineRanges.some(r => position.line >= r.startLine && position.line <= r.endLine)) {
+        return null;
+      }
+    }
+
     const text = document.getText();
     const offset = document.offsetAt(position);
 
-    // Find the style region containing the cursor
-    const regions = this.parseStyleRegions(text);
+    // Find the style region containing the cursor (cached by uri+version)
+    const regions = this.getCachedRegions(uri, version, text, document);
     const region = regions.find(
       (r) => offset > r.contentStart && offset <= r.contentEnd
     );
@@ -124,8 +132,8 @@ export class VueStyleCompletionProvider
       styleContent
     );
 
-    // Parse the stylesheet (cached by uri+version+langId)
-    const stylesheet = this.getStylesheet(ls, cssDoc, document.uri.toString(), document.version, langIdForDoc);
+    // Parse the stylesheet (cached by uri+version+contentStart)
+    const stylesheet = this.getStylesheet(ls, cssDoc, uri, version, region.contentStart);
 
     // Compute the relative position within the extracted style content
     const relativeOffset = offset - region.contentStart;
@@ -139,6 +147,7 @@ export class VueStyleCompletionProvider
     );
 
     if (!cssCompletions || cssCompletions.items.length === 0) return null;
+    if (token.isCancellationRequested) return null;
 
     // Map CSS-LS completion items to VS Code completion items
     const mappedItems: vscode.CompletionItem[] = cssCompletions.items.map(
@@ -241,11 +250,11 @@ export class VueStyleCompletionProvider
     switch (langId) {
       case "scss":
       case "sass":
-        return this.scssLS;
+        return (this._scssLS ??= getSCSSLanguageService());
       case "less":
-        return this.lessLS;
+        return (this._lessLS ??= getLESSLanguageService());
       default:
-        return this.cssLS;
+        return (this._cssLS ??= getCSSLanguageService());
     }
   }
 
@@ -254,15 +263,35 @@ export class VueStyleCompletionProvider
     doc: CSSTextDocument,
     uri: string,
     version: number,
-    langId: string
+    contentStart: number
   ): Stylesheet {
-    const c = this.cache;
-    if (c && c.uri === uri && c.version === version && c.langId === langId) {
-      return c.stylesheet;
+    // Invalidate entire cache when document changes
+    if (uri !== this.lastCacheUri || version !== this.lastCacheVersion) {
+      this.stylesheetCache.clear();
+      this.lastCacheUri = uri;
+      this.lastCacheVersion = version;
     }
-    const stylesheet = ls.parseStylesheet(doc);
-    this.cache = { uri, version, langId, stylesheet };
+    const key = String(contentStart);
+    let stylesheet = this.stylesheetCache.get(key);
+    if (!stylesheet) {
+      stylesheet = ls.parseStylesheet(doc);
+      this.stylesheetCache.set(key, stylesheet);
+    }
     return stylesheet;
+  }
+
+  private getCachedRegions(uri: string, version: number, text: string, doc: vscode.TextDocument): StyleRegion[] {
+    const c = this.regionCache;
+    if (c && c.uri === uri && c.version === version) {
+      return c.regions;
+    }
+    const regions = this.parseStyleRegions(text);
+    const lineRanges = regions.map(r => ({
+      startLine: doc.positionAt(r.contentStart).line,
+      endLine: doc.positionAt(r.contentEnd).line,
+    }));
+    this.regionCache = { uri, version, regions, lineRanges };
+    return regions;
   }
 
   /**
@@ -271,6 +300,7 @@ export class VueStyleCompletionProvider
   private parseStyleRegions(text: string): StyleRegion[] {
     const regions: StyleRegion[] = [];
     const blockPattern = /^<style(\b[^>]*)>/gim;
+    const closingRe = /<\/style\s*>/gim;
     let match: RegExpExecArray | null;
 
     while ((match = blockPattern.exec(text)) !== null) {
@@ -286,12 +316,12 @@ export class VueStyleCompletionProvider
       const attrs = match[1] || "";
       const contentStart = match.index + match[0].length;
 
-      // Find matching </style>
-      const closingRe = /^<\/style\s*>/im;
-      const closeMatch = closingRe.exec(text.substring(contentStart));
+      // Find matching </style> from contentStart
+      closingRe.lastIndex = contentStart;
+      const closeMatch = closingRe.exec(text);
       if (!closeMatch) continue;
 
-      const contentEnd = contentStart + closeMatch.index;
+      const contentEnd = closeMatch.index;
       const langId = this.detectLangId(attrs);
 
       regions.push({ langId, contentStart, contentEnd });
