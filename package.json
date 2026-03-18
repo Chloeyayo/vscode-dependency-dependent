@@ -88,6 +88,11 @@
           "default": "'\"(`",
           "description": "Block Select 中优先选中内容（不含分隔符）的符号集合。例如光标在 'str' 内时，第一次选中 str，第二次选中 'str'。"
         },
+        "dependencyDependent.vue.routerConfigPath": {
+          "type": "string",
+          "default": "",
+          "description": "Vue Router 配置文件路径（相对于工作区根目录）。留空则自动检测。"
+        },
         "typescript-plugins.suggest.enabled": {
           "type": "boolean",
           "default": true
@@ -251,6 +256,11 @@
       {
         "command": "dependency-dependent.funcEnhance",
         "title": "Func Enhance",
+        "category": "Dependency & Dependent"
+      },
+      {
+        "command": "dependency-dependent.openAtLine",
+        "title": "Open at Line",
         "category": "Dependency & Dependent"
       }
     ],

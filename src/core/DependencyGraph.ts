@@ -26,7 +26,7 @@ export class DependencyGraph {
   private resolver: any;
 
   /** The workspace root path */
-  private workspaceRoot: string;
+  public readonly workspaceRoot: string;
 
   /** Whether the initial full scan has been completed */
   private initialized = false;
@@ -259,7 +259,7 @@ export class DependencyGraph {
   /**
    * Resolve an import source (e.g., './foo', '@/utils') to an absolute path.
    */
-  private resolvePath(
+  public resolvePath(
     contextDir: string,
     request: string
   ): Promise<string | null> {

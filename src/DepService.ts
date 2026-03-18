@@ -4,6 +4,7 @@ import { glob } from "glob";
 import { Minimatch } from "minimatch";
 import { DepMap } from ".";
 import { DependencyGraph } from "./core/DependencyGraph";
+import { RouterAnalyzer, NavigationCall } from "./core/RouterAnalyzer";
 import { log } from "./extension";
 import { webpackConfigFileName } from "./share";
 
@@ -19,6 +20,9 @@ export class DepService {
 
   /** workspace fsPath -> DependencyGraph */
   private graphs = new Map<string, DependencyGraph>();
+
+  /** workspace fsPath -> RouterAnalyzer */
+  private routerAnalyzers = new Map<string, RouterAnalyzer>();
 
   /** FileSystemWatcher subscription */
   private watcher: vscode.FileSystemWatcher | undefined;
@@ -37,6 +41,7 @@ export class DepService {
       graph.dispose();
     }
     this.graphs.clear();
+    this.routerAnalyzers.clear();
     if (this.watcher) {
       this.watcher.dispose();
       this.watcher = undefined;
@@ -105,6 +110,28 @@ export class DepService {
     return graph.getDependentMap();
   }
 
+  async getNavigationSources(uri?: vscode.Uri): Promise<NavigationCall[]> {
+    const fsPath = uri?.fsPath;
+    if (!fsPath) return [];
+
+    const workspace = vscode.workspace.getWorkspaceFolder(uri);
+    const analyzer = await this.getRouterAnalyzer(workspace);
+    if (!analyzer) return [];
+
+    return analyzer.getNavigationSources(fsPath);
+  }
+
+  async isRouteTarget(uri?: vscode.Uri): Promise<boolean> {
+    const fsPath = uri?.fsPath;
+    if (!fsPath) return false;
+
+    const workspace = vscode.workspace.getWorkspaceFolder(uri);
+    const analyzer = await this.getRouterAnalyzer(workspace);
+    if (!analyzer) return false;
+
+    return analyzer.isRouteTarget(fsPath);
+  }
+
   /**
    * Force a full re-scan of the active workspace.
    * Called by the "Refresh" command.
@@ -127,6 +154,7 @@ export class DepService {
       oldGraph.dispose();
     }
     this.graphs.delete(fsPath);
+    this.routerAnalyzers.delete(fsPath);
     await this.getGraphForWorkspace(workspace);
 
     return true;
@@ -172,6 +200,16 @@ export class DepService {
 
           log.appendLine(`Incremental update: ${normalizedPath}`);
           await graph.processFile(normalizedPath);
+
+          // 增量同步路由跳转分析结果，避免整仓重扫
+          const analyzer = this.routerAnalyzers.get(fsPath);
+          if (analyzer?.isInitialized()) {
+            if (analyzer.getRouterConfigPath() === normalizedPath) {
+              await analyzer.refreshRouterConfig();
+            } else {
+              await analyzer.rescanFile(normalizedPath);
+            }
+          }
         }, 300)
       );
     };
@@ -194,6 +232,11 @@ export class DepService {
 
       log.appendLine(`File deleted, removing from graph: ${normalizedPath}`);
       graph.removeFile(normalizedPath);
+
+      const analyzer = this.routerAnalyzers.get(fsPath);
+      if (analyzer?.isInitialized()) {
+        analyzer.removeFile(normalizedPath);
+      }
     };
 
     this.watcher.onDidChange(handleFileChange);
@@ -204,6 +247,31 @@ export class DepService {
   }
 
   // ─── Internal ──────────────────────────────────────────────
+
+  /**
+   * Get or create a RouterAnalyzer for a workspace.
+   * Lazily initialized on first access.
+   */
+  private async getRouterAnalyzer(
+    workspace?: vscode.WorkspaceFolder
+  ): Promise<RouterAnalyzer | null> {
+    const fsPath = workspace?.uri?.fsPath;
+    if (!fsPath) return null;
+
+    let analyzer = this.routerAnalyzers.get(fsPath);
+    if (analyzer?.isInitialized()) return analyzer;
+
+    const graph = await this.getGraphForWorkspace(workspace);
+    if (!graph) return null;
+
+    if (!analyzer) {
+      analyzer = new RouterAnalyzer(fsPath, graph);
+      this.routerAnalyzers.set(fsPath, analyzer);
+    }
+
+    await analyzer.initialize();
+    return analyzer.isInitialized() ? analyzer : null;
+  }
 
   /**
    * Get or create a DependencyGraph for a workspace.

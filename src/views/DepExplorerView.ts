@@ -1,6 +1,7 @@
 import * as path from "node:path";
 import * as vscode from "vscode";
 import { DepService } from "../DepService";
+import { NavigationCall } from "../core/RouterAnalyzer";
 import { getLoading, getLocked } from "../core/context";
 import getRelativePath from "../core/getRelativePath";
 import { log } from "../extension";
@@ -13,11 +14,13 @@ export enum DepTypeEnum {
   Root = "Root",
   Dependency = "Dependency",
   Dependent = "Dependent",
+  NavigationSource = "NavigationSource",
 }
 
 export class DepTreeItem extends vscode.TreeItem {
   depType: DepTypeEnum = DepTypeEnum.Dependency;
   depUri: vscode.Uri | undefined;
+  navigationCall?: NavigationCall;
 }
 
 export default class DepExplorerView
@@ -110,14 +113,14 @@ export default class DepExplorerView
       for (const dependency of dependencies) {
         const uri = vscode.Uri.file(dependency);
         const item = new DepTreeItem(uri);
-        
+
         // Optimally check for children using the map directly
-        const hasChildren = 
-          dependencyMap.has(uri.fsPath) && 
+        const hasChildren =
+          dependencyMap.has(uri.fsPath) &&
           dependencyMap.get(uri.fsPath)!.size > 0;
 
         item.depUri = uri;
-        
+
         // Smart Label for index files
         const basename = path.basename(uri.fsPath);
         if (basename.startsWith("index.")) {
@@ -140,6 +143,40 @@ export default class DepExplorerView
         }
 
         item.depType = DepTypeEnum.Dependency;
+
+        items.push(item);
+      }
+
+      return items;
+    } else if (element.depType === DepTypeEnum.NavigationSource) {
+      const navCalls = await DepService.singleton.getNavigationSources(element.depUri);
+      const items: DepTreeItem[] = [];
+
+      for (const call of navCalls) {
+        const uri = vscode.Uri.file(call.callerFile);
+        const item = new DepTreeItem(uri);
+
+        item.depUri = uri;
+
+        // Smart Label for index files (same as Dependent)
+        const basename = path.basename(uri.fsPath);
+        if (basename.startsWith("index.")) {
+          const dirname = path.basename(path.dirname(uri.fsPath));
+          item.label = dirname;
+          item.description = `${basename} • ${call.method}(${call.targetType === "name" ? `{ name: '${call.targetValue}' }` : `'${call.targetValue}'`})`;
+        } else {
+          item.description = `${call.method}(${call.targetType === "name" ? `{ name: '${call.targetValue}' }` : `'${call.targetValue}'`})`;
+        }
+
+        item.command = {
+          title: "open",
+          command: "dependency-dependent.openAtLine",
+          arguments: [call.callerFile, call.selection],
+        };
+
+        item.iconPath = vscode.ThemeIcon.File;
+        item.navigationCall = call;
+        item.depType = DepTypeEnum.NavigationSource;
 
         items.push(item);
       }
@@ -211,11 +248,14 @@ export default class DepExplorerView
         this.currentRootUri = uri;
       }
 
-      const dependencies = await DepService.singleton.getDependencies(uri);
-      const dependents = await DepService.singleton.getDependents(uri);
+      const [dependencies, dependents, navCalls] = await Promise.all([
+        DepService.singleton.getDependencies(uri),
+        DepService.singleton.getDependents(uri),
+        DepService.singleton.getNavigationSources(uri),
+      ]);
 
-      if (!dependencies.length && !dependents.length) {
-        throw new Error("No dependency or dependent found.");
+      if (!dependencies.length && !dependents.length && !navCalls.length) {
+        throw new Error("No dependency, dependent or navigation source found.");
       }
 
       const workspaceUri = vscode.workspace.getWorkspaceFolder(uri)?.uri;
@@ -244,7 +284,7 @@ export default class DepExplorerView
       return [rootTreeItem];
     } catch (e: any) {
       this.setTreeViewMessage(
-        "No dependency or dependent found for this file.\n Please check config, see https://github.com/zjffun/vscode-dependency-dependent"
+        "No dependency, dependent, or navigation source found for this file.\n Please check config, see https://github.com/zjffun/vscode-dependency-dependent"
       );
       log.appendLine(e.message);
       return null;
@@ -252,22 +292,51 @@ export default class DepExplorerView
   }
 
   protected async getSubTreeItems(element: DepTreeItem) {
-    const dependencyTreeItem = new DepTreeItem(
-      vscode.l10n.t("Dependencies")
-    );
-    dependencyTreeItem.depType = DepTypeEnum.Dependency;
-    dependencyTreeItem.collapsibleState =
-      vscode.TreeItemCollapsibleState.Expanded;
-    dependencyTreeItem.depUri = element.depUri;
+    if (!element.depUri) {
+      return [];
+    }
 
-    const dependentTreeItem = new DepTreeItem(
-      vscode.l10n.t("Dependents")
-    );
-    dependentTreeItem.depType = DepTypeEnum.Dependent;
-    dependentTreeItem.collapsibleState =
-      vscode.TreeItemCollapsibleState.Expanded;
-    dependentTreeItem.depUri = element.depUri;
+    const [dependencies, dependents, navCalls] = await Promise.all([
+      DepService.singleton.getDependencies(element.depUri),
+      DepService.singleton.getDependents(element.depUri),
+      DepService.singleton.getNavigationSources(element.depUri),
+    ]);
 
-    return [dependentTreeItem, dependencyTreeItem];
+    const result: DepTreeItem[] = [];
+
+    if (dependents.length > 0) {
+      const dependentTreeItem = new DepTreeItem(
+        vscode.l10n.t("Dependents")
+      );
+      dependentTreeItem.depType = DepTypeEnum.Dependent;
+      dependentTreeItem.collapsibleState =
+        vscode.TreeItemCollapsibleState.Expanded;
+      dependentTreeItem.depUri = element.depUri;
+      result.push(dependentTreeItem);
+    }
+
+    if (dependencies.length > 0) {
+      const dependencyTreeItem = new DepTreeItem(
+        vscode.l10n.t("Dependencies")
+      );
+      dependencyTreeItem.depType = DepTypeEnum.Dependency;
+      dependencyTreeItem.collapsibleState =
+        vscode.TreeItemCollapsibleState.Expanded;
+      dependencyTreeItem.depUri = element.depUri;
+      result.push(dependencyTreeItem);
+    }
+
+    if (navCalls.length > 0) {
+      const navTreeItem = new DepTreeItem(
+        vscode.l10n.t("Navigation Sources")
+      );
+      navTreeItem.depType = DepTypeEnum.NavigationSource;
+      navTreeItem.collapsibleState =
+        vscode.TreeItemCollapsibleState.Expanded;
+      navTreeItem.depUri = element.depUri;
+      result.push(navTreeItem);
+    }
+
+    return result;
   }
 }

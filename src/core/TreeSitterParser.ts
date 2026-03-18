@@ -388,7 +388,7 @@ export class TreeSitterParser {
      * If the same content was parsed before, the cached tree is returned
      * immediately (zero cost). Old entries are evicted when cache is full.
      */
-    private async parseWithCache(langId: string, content: string): Promise<any | null> {
+    public async parseWithCache(langId: string, content: string): Promise<any | null> {
         const parser = await this.getParser(langId);
         if (!parser) return null;
 
