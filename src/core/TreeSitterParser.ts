@@ -116,9 +116,9 @@ export class TreeSitterParser {
     private parserLoading: Map<string, Promise<Parser | undefined>> = new Map();
     /** LRU tree cache keyed by content hash — avoids thrashing when parsing multiple files */
     private treeCache: Map<number, { langId: string; tree: any }> = new Map();
-    private static readonly TREE_CACHE_MAX = 10;
+    private static readonly TREE_CACHE_MAX = 50;
     private vueOptionsIndexCache: Map<number, VueOptionsIndex> = new Map();
-    private static readonly VUE_OPTIONS_INDEX_CACHE_MAX = 10;
+    private static readonly VUE_OPTIONS_INDEX_CACHE_MAX = 50;
     private wasmDir: string;
     private initialized = false;
     private missingLanguageLog = new Set<string>();

@@ -27,6 +27,9 @@ export class DepService {
     excludes: Minimatch[];
   }>();
 
+  /** Per-file debounce timers for file change events */
+  private pendingFileChanges = new Map<string, ReturnType<typeof setTimeout>>();
+
   constructor() {}
 
   dispose() {
@@ -38,6 +41,10 @@ export class DepService {
       this.watcher.dispose();
       this.watcher = undefined;
     }
+    for (const timer of this.pendingFileChanges.values()) {
+      clearTimeout(timer);
+    }
+    this.pendingFileChanges.clear();
     this.workspaceMatchers.clear();
     singletonInstance = undefined!;
   }
@@ -138,24 +145,35 @@ export class DepService {
       "**/*.{js,ts,jsx,tsx,vue}"
     );
 
-    const handleFileChange = async (uri: vscode.Uri) => {
-      const workspace = vscode.workspace.getWorkspaceFolder(uri);
-      const fsPath = workspace?.uri?.fsPath;
-      if (!fsPath) {
-        return;
+    const handleFileChange = (uri: vscode.Uri) => {
+      const key = uri.fsPath;
+      const existing = this.pendingFileChanges.get(key);
+      if (existing) {
+        clearTimeout(existing);
       }
+      this.pendingFileChanges.set(
+        key,
+        setTimeout(async () => {
+          this.pendingFileChanges.delete(key);
+          const workspace = vscode.workspace.getWorkspaceFolder(uri);
+          const fsPath = workspace?.uri?.fsPath;
+          if (!fsPath) {
+            return;
+          }
 
-      const graph = this.graphs.get(fsPath);
-      if (!graph || !graph.isInitialized()) {
-        return;
-      }
-      const normalizedPath = vscode.Uri.file(uri.fsPath).fsPath;
-      if (!this.shouldProcessFile(fsPath, normalizedPath, graph, true)) {
-        return;
-      }
+          const graph = this.graphs.get(fsPath);
+          if (!graph || !graph.isInitialized()) {
+            return;
+          }
+          const normalizedPath = vscode.Uri.file(uri.fsPath).fsPath;
+          if (!this.shouldProcessFile(fsPath, normalizedPath, graph, true)) {
+            return;
+          }
 
-      log.appendLine(`Incremental update: ${normalizedPath}`);
-      await graph.processFile(normalizedPath);
+          log.appendLine(`Incremental update: ${normalizedPath}`);
+          await graph.processFile(normalizedPath);
+        }, 300)
+      );
     };
 
     const handleFileDelete = (uri: vscode.Uri) => {
@@ -221,7 +239,14 @@ export class DepService {
     );
 
     log.appendLine(`Initializing DependencyGraph for workspace: ${fsPath}`);
-    await graph.initialize(entryConfig, excludesConfig);
+    await vscode.window.withProgress(
+      {
+        location: vscode.ProgressLocation.Window,
+        title: "Scanning dependencies...",
+        cancellable: true,
+      },
+      (_progress, token) => graph!.initialize(entryConfig, excludesConfig, token)
+    );
 
     return graph;
   }

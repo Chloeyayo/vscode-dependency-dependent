@@ -31,6 +31,11 @@ export { log };
 const BS_CLOSE_OPEN: Record<string, string> = { '}': '{', ']': '[', ')': '(' };
 // Block select: open→close bracket lookup
 const BS_OPEN_CLOSE: Record<string, string> = { '{': '}', '[': ']', '(': ')' };
+// Block select: inner-first delimiter → matching closer
+const BS_INNER_CLOSERS: Record<string, string> = {
+  "'": "'", '"': '"', '`': '`',
+  '(': ')', '[': ']', '{': '}'
+};
 
 /** Check if char at `pos` is escaped by counting preceding backslashes */
 function isEscapedAt(text: string, pos: number): boolean {
@@ -78,32 +83,76 @@ function findMatchForward(text: string, openPos: number): number {
   return -1;
 }
 
+// Block select: known HTML void elements (no closing tag)
+const BS_VOID_ELEMENTS = new Set([
+  'area', 'base', 'br', 'col', 'embed', 'hr', 'img', 'input',
+  'link', 'meta', 'param', 'source', 'track', 'wbr'
+]);
+
+/**
+ * Find the innermost HTML/XML tag pair enclosing the range [L, R].
+ * Handles nesting, void elements, self-closing tags, and quoted attributes containing '>'.
+ * Returns { start, end } covering from '<' of opener to '>' of closer, or null.
+ */
+function findEnclosingTag(text: string, L: number, R: number): { start: number; end: number } | null {
+  // Regex matches opening/closing tags, correctly handling quoted attribute values
+  const tagRe = /<(\/?)([a-zA-Z][\w-:.]*)\b(?:[^>"']*(?:"[^"]*"|'[^']*'))*[^>"']*(\/?)>/g;
+  const allTags: { name: string; start: number; end: number; isClose: boolean }[] = [];
+  let m: RegExpExecArray | null;
+
+  while ((m = tagRe.exec(text)) !== null) {
+    const isClose = m[1] === '/';
+    const isSelfClose = m[3] === '/';
+    const name = m[2].toLowerCase();
+    if (isSelfClose || BS_VOID_ELEMENTS.has(name)) continue;
+    allTags.push({ name, start: m.index, end: m.index + m[0].length, isClose });
+  }
+
+  // Backward scan: find innermost unmatched opening tag at or before L
+  const closeStack: string[] = [];
+  let openerIdx = -1;
+  for (let i = allTags.length - 1; i >= 0; i--) {
+    const t = allTags[i];
+    if (t.start > L) continue;
+    if (t.isClose) {
+      closeStack.push(t.name);
+    } else {
+      if (closeStack.length > 0 && closeStack[closeStack.length - 1] === t.name) {
+        closeStack.pop();
+      } else {
+        openerIdx = i;
+        break;
+      }
+    }
+  }
+
+  if (openerIdx === -1) return null;
+  const opener = allTags[openerIdx];
+
+  // Forward scan: find matching closer for the opener
+  let depth = 0;
+  for (let i = openerIdx + 1; i < allTags.length; i++) {
+    const t = allTags[i];
+    if (t.name !== opener.name) continue;
+    if (t.isClose) {
+      if (depth === 0) {
+        return t.end >= R ? { start: opener.start, end: t.end } : null;
+      }
+      depth--;
+    } else {
+      depth++;
+    }
+  }
+
+  return null;
+}
+
 // Stored for deactivate() to cancel
 let _debouncedRefresh: ReturnType<typeof debounce> | undefined;
 
 export function activate(context: vscode.ExtensionContext) {
   log.appendLine("Extension activating...");
   setContext(context);
-
-  // 拉起 TypeScript 语言服务并注册插件
-  const activateTSPlugin = async () => {
-    try {
-      const tsExt = vscode.extensions.getExtension('vscode.typescript-language-features');
-      if (!tsExt) return;
-
-      await tsExt.activate();
-      const api = tsExt.exports?.getAPI?.(0);
-      if (api) {
-        api.configurePlugin('dependency-dependent-ts-plugin', {});
-        log.appendLine('[TS] Plugin successfully configured.');
-      }
-    } catch (e: any) {
-      log.appendLine(`[TS] Error activating TS extension: ${e?.message || e}`);
-    }
-  };
-
-  // 立即触发（因为是在 onLanguage:vue 被激活，所以此时环境已经就绪）
-  activateTSPlugin();
 
   // Initialize TreeSitterParser with correct extension path
   // Try src/grammars first (dev mode), fall back to grammars/ (packaged extension)
@@ -272,6 +321,9 @@ export function activate(context: vscode.ExtensionContext) {
       let R = doc.offsetAt(sel.end);
 
       const isWordChar = (c: string) => /[a-zA-Z0-9_$]/.test(c);
+      const innerFirstChars: string = vscode.workspace
+        .getConfiguration('dependencyDependent')
+        .get<string>('blockSelect.innerFirstChars', '\'\"(`') ?? '';
 
       // --- Phase 0: Member declaration / call-expression detection ---
       // When cursor is on a word (no selection), try to select the entire member or call expression.
@@ -498,6 +550,21 @@ export function activate(context: vscode.ExtensionContext) {
         }
       }
 
+      // --- Phase 0.6: Inner-first expansion ---
+      // When selection is the inner content of a configured delimiter pair,
+      // expand to include the delimiters.
+      if (L !== R && L > 0 && R < len) {
+        const leftChar = text[L - 1];
+        if (innerFirstChars.includes(leftChar)) {
+          const expectedClose = BS_INNER_CLOSERS[leftChar];
+          if (expectedClose && text[R] === expectedClose) {
+            editor.selection = new vscode.Selection(doc.positionAt(L - 1), doc.positionAt(R + 1));
+            return;
+          }
+        }
+      }
+
+      const origL = L, origR = R;
       if (L !== R) { L--; R++; }
 
       // --- 1. Bracket scan (stack-based, handles nesting) ---
@@ -590,23 +657,36 @@ export function activate(context: vscode.ExtensionContext) {
         }
       }
 
+      // --- 2.5. HTML/XML tag pair scan ---
+      const tagPair = findEnclosingTag(text, L, R);
+
       // --- 3. Pick tightest result ---
       let rStart: number, rEnd: number;
       const hasBracket = bStart !== -1 && bEnd !== -1;
       const hasQuote = qStart !== -1 && qEnd !== -1;
+      const hasTag = tagPair !== null;
 
-      if (hasBracket && hasQuote) {
-        if ((qEnd - qStart) < (bEnd - bStart)) {
-          rStart = qStart; rEnd = qEnd;
-        } else {
-          rStart = bStart; rEnd = bEnd;
+      const candidates: [number, number][] = [];
+      if (hasBracket) candidates.push([bStart, bEnd]);
+      if (hasQuote) candidates.push([qStart, qEnd]);
+      if (hasTag) candidates.push([tagPair!.start, tagPair!.end]);
+
+      if (candidates.length === 0) return;
+
+      [rStart, rEnd] = candidates[0];
+      for (let ci = 1; ci < candidates.length; ci++) {
+        if ((candidates[ci][1] - candidates[ci][0]) < (rEnd - rStart)) {
+          [rStart, rEnd] = candidates[ci];
         }
-      } else if (hasBracket) {
-        rStart = bStart; rEnd = bEnd;
-      } else if (hasQuote) {
-        rStart = qStart; rEnd = qEnd;
-      } else {
-        return;
+      }
+
+      // Inner-first: for configured delimiters, select content without delimiters first
+      if (rEnd - rStart > 2 && innerFirstChars.includes(text[rStart])) {
+        const iStart = rStart + 1, iEnd = rEnd - 1;
+        if (origL !== iStart || origR !== iEnd) {
+          rStart = iStart;
+          rEnd = iEnd;
+        }
       }
 
       // --- 4. Include trailing comma or semicolon ---

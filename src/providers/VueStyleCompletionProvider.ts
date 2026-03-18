@@ -16,6 +16,7 @@ interface CachedRegions {
   uri: string;
   version: number;
   regions: StyleRegion[];
+  lineRanges: { startLine: number; endLine: number }[];
 }
 
 /**
@@ -80,19 +81,13 @@ function mapCompletionItemKind(
 export class VueStyleCompletionProvider
   implements vscode.CompletionItemProvider
 {
-  private cssLS: CSSLanguageService;
-  private scssLS: CSSLanguageService;
-  private lessLS: CSSLanguageService;
+  private _cssLS?: CSSLanguageService;
+  private _scssLS?: CSSLanguageService;
+  private _lessLS?: CSSLanguageService;
   private stylesheetCache = new Map<string, Stylesheet>();
   private lastCacheVersion = -1;
   private lastCacheUri = "";
   private regionCache: CachedRegions | null = null;
-
-  constructor() {
-    this.cssLS = getCSSLanguageService();
-    this.scssLS = getSCSSLanguageService();
-    this.lessLS = getLESSLanguageService();
-  }
 
   async provideCompletionItems(
     document: vscode.TextDocument,
@@ -102,13 +97,22 @@ export class VueStyleCompletionProvider
   ): Promise<vscode.CompletionList | null> {
     if (!document.fileName.endsWith(".vue")) return null;
 
-    const text = document.getText();
-    const offset = document.offsetAt(position);
     const uri = document.uri.toString();
     const version = document.version;
 
+    // Fast line-range pre-check: skip getText() when cursor is outside all <style> blocks
+    const cached = this.regionCache;
+    if (cached && cached.uri === uri && cached.version === version) {
+      if (!cached.lineRanges.some(r => position.line >= r.startLine && position.line <= r.endLine)) {
+        return null;
+      }
+    }
+
+    const text = document.getText();
+    const offset = document.offsetAt(position);
+
     // Find the style region containing the cursor (cached by uri+version)
-    const regions = this.getCachedRegions(uri, version, text);
+    const regions = this.getCachedRegions(uri, version, text, document);
     const region = regions.find(
       (r) => offset > r.contentStart && offset <= r.contentEnd
     );
@@ -143,6 +147,7 @@ export class VueStyleCompletionProvider
     );
 
     if (!cssCompletions || cssCompletions.items.length === 0) return null;
+    if (token.isCancellationRequested) return null;
 
     // Map CSS-LS completion items to VS Code completion items
     const mappedItems: vscode.CompletionItem[] = cssCompletions.items.map(
@@ -245,11 +250,11 @@ export class VueStyleCompletionProvider
     switch (langId) {
       case "scss":
       case "sass":
-        return this.scssLS;
+        return (this._scssLS ??= getSCSSLanguageService());
       case "less":
-        return this.lessLS;
+        return (this._lessLS ??= getLESSLanguageService());
       default:
-        return this.cssLS;
+        return (this._cssLS ??= getCSSLanguageService());
     }
   }
 
@@ -275,13 +280,17 @@ export class VueStyleCompletionProvider
     return stylesheet;
   }
 
-  private getCachedRegions(uri: string, version: number, text: string): StyleRegion[] {
+  private getCachedRegions(uri: string, version: number, text: string, doc: vscode.TextDocument): StyleRegion[] {
     const c = this.regionCache;
     if (c && c.uri === uri && c.version === version) {
       return c.regions;
     }
     const regions = this.parseStyleRegions(text);
-    this.regionCache = { uri, version, regions };
+    const lineRanges = regions.map(r => ({
+      startLine: doc.positionAt(r.contentStart).line,
+      endLine: doc.positionAt(r.contentEnd).line,
+    }));
+    this.regionCache = { uri, version, regions, lineRanges };
     return regions;
   }
 
