@@ -752,6 +752,67 @@ export function activate(context: vscode.ExtensionContext) {
   );
 
   context.subscriptions.push(
+    vscode.commands.registerCommand(
+      "dependency-dependent.openAtLine",
+      async (
+        filePath: string,
+        location:
+          | number
+          | {
+              startLine: number;
+              startCharacter: number;
+              endLine: number;
+              endCharacter: number;
+            }
+      ) => {
+        try {
+          const doc = await vscode.workspace.openTextDocument(
+            vscode.Uri.file(filePath)
+          );
+          const editor = await vscode.window.showTextDocument(doc);
+
+          let range: vscode.Range;
+          if (typeof location === "number") {
+            const safeLine = Math.min(Math.max(0, location), doc.lineCount - 1);
+            range = doc.lineAt(safeLine).range;
+          } else {
+            const clampLine = (line: number) =>
+              Math.min(Math.max(0, line), doc.lineCount - 1);
+            const clampCharacter = (line: number, character: number) =>
+              Math.min(
+                Math.max(0, character),
+                doc.lineAt(line).range.end.character
+              );
+
+            const startLine = clampLine(location.startLine);
+            const endLine = clampLine(location.endLine);
+            const startCharacter = clampCharacter(
+              startLine,
+              location.startCharacter
+            );
+            const endCharacter = clampCharacter(
+              endLine,
+              location.endCharacter
+            );
+
+            const start = new vscode.Position(startLine, startCharacter);
+            const end = new vscode.Position(endLine, endCharacter);
+            range =
+              start.isAfter(end) || start.isEqual(end)
+                ? doc.lineAt(startLine).range
+                : new vscode.Range(start, end);
+          }
+
+          editor.selection = new vscode.Selection(range.start, range.end);
+          editor.revealRange(range, vscode.TextEditorRevealType.InCenter);
+        } catch {
+          vscode.window.showErrorMessage(`Could not open file: ${filePath}`);
+        }
+      }
+    )
+  );
+
+  context.subscriptions.push(
       vscode.commands.registerCommand(
           "dependency-dependent.vueTimeline.jumpToLocation",
           (item) => {
