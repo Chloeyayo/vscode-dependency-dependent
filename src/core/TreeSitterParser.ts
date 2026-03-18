@@ -121,6 +121,7 @@ export class TreeSitterParser {
     private static readonly VUE_OPTIONS_INDEX_CACHE_MAX = 50;
     private wasmDir: string;
     private initialized = false;
+    private initPromise?: Promise<void>;
     private missingLanguageLog = new Set<string>();
 
     private constructor(wasmDir: string) {
@@ -271,40 +272,47 @@ export class TreeSitterParser {
 
     public async init(): Promise<void> {
         if (this.initialized) return;
+        if (this.initPromise) return this.initPromise;
 
-        try {
-            this.refreshWasmDir(this.wasmDir);
-            const treeSitterWasmPath = this.resolveCoreWasmPath();
-            if (!treeSitterWasmPath) {
-                throw new Error(
-                    `Cannot locate web-tree-sitter core wasm. wasmDir=${this.wasmDir}`
-                );
-            }
-            log.appendLine(`TreeSitter wasmDir: ${this.wasmDir}`);
-            log.appendLine(`TreeSitter wasm path: ${treeSitterWasmPath}`);
-
-            log.appendLine('Step 1: About to call Parser.init()');
+        this.initPromise = (async () => {
             try {
-                if (typeof ParserRuntimeInit !== 'function') {
-                    throw new Error('web-tree-sitter init API not found');
+                this.refreshWasmDir(this.wasmDir);
+                const treeSitterWasmPath = this.resolveCoreWasmPath();
+                if (!treeSitterWasmPath) {
+                    throw new Error(
+                        `Cannot locate web-tree-sitter core wasm. wasmDir=${this.wasmDir}`
+                    );
                 }
-                await ParserRuntimeInit({
-                    locateFile(scriptName: string) {
-                        return treeSitterWasmPath;
+                log.appendLine(`TreeSitter wasmDir: ${this.wasmDir}`);
+                log.appendLine(`TreeSitter wasm path: ${treeSitterWasmPath}`);
+
+                log.appendLine('Step 1: About to call Parser.init()');
+                try {
+                    if (typeof ParserRuntimeInit !== 'function') {
+                        throw new Error('web-tree-sitter init API not found');
                     }
-                } as any);
-                log.appendLine('Step 2: Parser.init() completed');
-            } catch (initErr: any) {
-                log.appendLine(`Parser.init() failed: ${initErr.message}`);
-                log.appendLine(`Stack: ${initErr.stack}`);
-                throw initErr;
+                    await ParserRuntimeInit({
+                        locateFile(scriptName: string) {
+                            return treeSitterWasmPath;
+                        }
+                    } as any);
+                    log.appendLine('Step 2: Parser.init() completed');
+                } catch (initErr: any) {
+                    log.appendLine(`Parser.init() failed: ${initErr.message}`);
+                    log.appendLine(`Stack: ${initErr.stack}`);
+                    throw initErr;
+                }
+                log.appendLine('Tree-sitter initialized');
+                this.initialized = true;
+            } catch (e: any) {
+                log.appendLine(`Failed to initialize tree-sitter: ${e.message}`);
+                throw e;
+            } finally {
+                this.initPromise = undefined;
             }
-            log.appendLine('Tree-sitter initialized');
-            this.initialized = true;
-        } catch (e: any) {
-            log.appendLine(`Failed to initialize tree-sitter: ${e.message}`);
-            throw e;
-        }
+        })();
+
+        return this.initPromise;
     }
 
     public async getParser(langId: string): Promise<Parser | undefined> {

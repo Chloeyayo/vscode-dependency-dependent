@@ -1,6 +1,6 @@
 import * as vscode from "vscode";
-import { TreeSitterParser } from "../core/TreeSitterParser";
 import { VuePrototypeScanner } from "../core/VuePrototypeScanner";
+import { VueDocumentModelManager } from "../core/VueDocumentModelManager";
 
 /**
  * Vue2 Options API Definition Provider
@@ -10,11 +10,11 @@ import { VuePrototypeScanner } from "../core/VuePrototypeScanner";
  * - this.$xxx -> Vue.prototype assignments / plugin imports in entry files
  */
 export class VueOptionsDefinitionProvider implements vscode.DefinitionProvider {
-  private treeSitterParser: TreeSitterParser;
+  private documentModels: VueDocumentModelManager;
   private prototypeScanner: VuePrototypeScanner;
 
   constructor(prototypeScanner?: VuePrototypeScanner) {
-    this.treeSitterParser = TreeSitterParser.getInstance();
+    this.documentModels = VueDocumentModelManager.getInstance();
     this.prototypeScanner = prototypeScanner ?? new VuePrototypeScanner();
   }
 
@@ -41,11 +41,14 @@ export class VueOptionsDefinitionProvider implements vscode.DefinitionProvider {
 
     if (token.isCancellationRequested) return null;
 
+    const model = this.documentModels.getDocumentModel(document);
+
     // Otherwise: try component property definition from the shared VueOptionsIndex
-    const fileContent = document.getText();
     try {
       const chain = this.getThisPropertyChain(document, wordRange, targetWord);
-      const result = await this.treeSitterParser.findVueOptionDefinition(fileContent, targetWord, chain);
+      const index = await model.getVueOptionsIndex();
+      const pathKey = chain.length > 0 ? chain.join(".") : targetWord;
+      const result = index.entriesByPath.get(pathKey) || index.entriesByPath.get(targetWord);
 
       if (result) {
         const startPos = document.positionAt(result.start);

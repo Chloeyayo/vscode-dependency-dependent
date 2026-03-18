@@ -4,7 +4,8 @@ import * as fs from "fs";
 import { ResolverFactory, CachedInputFileSystem } from "enhanced-resolve";
 import { DepService } from "../DepService";
 import { TreeSitterParser } from "../core/TreeSitterParser";
-import { isOffsetInsideRootTemplate } from "../core/vueTemplateUtils";
+import { VueDocumentModelManager } from "../core/VueDocumentModelManager";
+import { VueTemplateContextService } from "../core/VueTemplateContextService";
 
 import { log } from "../extension";
 
@@ -12,9 +13,13 @@ export class WebpackDefinitionProvider implements vscode.DefinitionProvider {
   private resolver: any;
   private lastWorkspace: string | undefined;
   private treeSitterParser: TreeSitterParser;
+  private documentModels: VueDocumentModelManager;
+  private templateContext: VueTemplateContextService;
 
   constructor() {
     this.treeSitterParser = TreeSitterParser.getInstance();
+    this.documentModels = VueDocumentModelManager.getInstance();
+    this.templateContext = VueTemplateContextService.getInstance();
   }
 
   async provideDefinition(
@@ -22,17 +27,18 @@ export class WebpackDefinitionProvider implements vscode.DefinitionProvider {
     position: vscode.Position,
     token: vscode.CancellationToken
   ): Promise<vscode.Definition | undefined> {
-
-    const fileContent = document.getText();
     const offset = document.offsetAt(position);
     const filePath = document.uri.fsPath;
+    const isVueFile = document.languageId === "vue" || document.fileName.endsWith(".vue");
+    const model = isVueFile ? this.documentModels.getDocumentModel(document) : undefined;
+    const text = model?.text ?? document.getText();
 
     let request: string | undefined;
 
     // Strategy 1: Check if cursor is inside an import/require string
     try {
       const importSource = await this.treeSitterParser.findImportSourceAtPosition(
-        fileContent,
+        text,
         filePath,
         offset
       );
@@ -46,8 +52,8 @@ export class WebpackDefinitionProvider implements vscode.DefinitionProvider {
     // Strategy 2: 仅在 Vue 根级 <template> 内，把组件标签名映射到当前文件的 import 路径
     if (
       !request &&
-      document.languageId === "vue" &&
-      isOffsetInsideRootTemplate(fileContent, offset)
+      isVueFile &&
+      this.templateContext.isInsideRootTemplate(model?.templateBounds ?? null, offset)
     ) {
       // 允许带 `-/_` 的标签名（kebab-case / snake_case）
       const range = document.getWordRangeAtPosition(position, /[\w-]+/);
@@ -59,7 +65,7 @@ export class WebpackDefinitionProvider implements vscode.DefinitionProvider {
           // 使用 TreeSitter：把标签名映射到当前文件的 import（兼容 my-com / my_com / mycom / MyCom 等）
           try {
             const importPath = await this.treeSitterParser.findImportPathForComponentTag(
-              fileContent,
+              text,
               filePath,
               word
             );
