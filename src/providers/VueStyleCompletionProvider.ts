@@ -12,10 +12,11 @@ import {
 } from "vscode-css-languageservice";
 import { InsertReplaceEdit } from "vscode-languageserver-types";
 
-interface CachedRegions {
+interface CachedStylesheet {
   uri: string;
   version: number;
-  regions: StyleRegion[];
+  langId: string;
+  stylesheet: Stylesheet;
 }
 
 /**
@@ -83,10 +84,7 @@ export class VueStyleCompletionProvider
   private cssLS: CSSLanguageService;
   private scssLS: CSSLanguageService;
   private lessLS: CSSLanguageService;
-  private stylesheetCache = new Map<string, Stylesheet>();
-  private lastCacheVersion = -1;
-  private lastCacheUri = "";
-  private regionCache: CachedRegions | null = null;
+  private cache: CachedStylesheet | null = null;
 
   constructor() {
     this.cssLS = getCSSLanguageService();
@@ -104,11 +102,9 @@ export class VueStyleCompletionProvider
 
     const text = document.getText();
     const offset = document.offsetAt(position);
-    const uri = document.uri.toString();
-    const version = document.version;
 
-    // Find the style region containing the cursor (cached by uri+version)
-    const regions = this.getCachedRegions(uri, version, text);
+    // Find the style region containing the cursor
+    const regions = this.parseStyleRegions(text);
     const region = regions.find(
       (r) => offset > r.contentStart && offset <= r.contentEnd
     );
@@ -128,8 +124,8 @@ export class VueStyleCompletionProvider
       styleContent
     );
 
-    // Parse the stylesheet (cached by uri+version+contentStart)
-    const stylesheet = this.getStylesheet(ls, cssDoc, uri, version, region.contentStart);
+    // Parse the stylesheet (cached by uri+version+langId)
+    const stylesheet = this.getStylesheet(ls, cssDoc, document.uri.toString(), document.version, langIdForDoc);
 
     // Compute the relative position within the extracted style content
     const relativeOffset = offset - region.contentStart;
@@ -258,31 +254,15 @@ export class VueStyleCompletionProvider
     doc: CSSTextDocument,
     uri: string,
     version: number,
-    contentStart: number
+    langId: string
   ): Stylesheet {
-    // Invalidate entire cache when document changes
-    if (uri !== this.lastCacheUri || version !== this.lastCacheVersion) {
-      this.stylesheetCache.clear();
-      this.lastCacheUri = uri;
-      this.lastCacheVersion = version;
+    const c = this.cache;
+    if (c && c.uri === uri && c.version === version && c.langId === langId) {
+      return c.stylesheet;
     }
-    const key = String(contentStart);
-    let stylesheet = this.stylesheetCache.get(key);
-    if (!stylesheet) {
-      stylesheet = ls.parseStylesheet(doc);
-      this.stylesheetCache.set(key, stylesheet);
-    }
+    const stylesheet = ls.parseStylesheet(doc);
+    this.cache = { uri, version, langId, stylesheet };
     return stylesheet;
-  }
-
-  private getCachedRegions(uri: string, version: number, text: string): StyleRegion[] {
-    const c = this.regionCache;
-    if (c && c.uri === uri && c.version === version) {
-      return c.regions;
-    }
-    const regions = this.parseStyleRegions(text);
-    this.regionCache = { uri, version, regions };
-    return regions;
   }
 
   /**
@@ -291,7 +271,6 @@ export class VueStyleCompletionProvider
   private parseStyleRegions(text: string): StyleRegion[] {
     const regions: StyleRegion[] = [];
     const blockPattern = /^<style(\b[^>]*)>/gim;
-    const closingRe = /<\/style\s*>/gim;
     let match: RegExpExecArray | null;
 
     while ((match = blockPattern.exec(text)) !== null) {
@@ -307,12 +286,12 @@ export class VueStyleCompletionProvider
       const attrs = match[1] || "";
       const contentStart = match.index + match[0].length;
 
-      // Find matching </style> from contentStart
-      closingRe.lastIndex = contentStart;
-      const closeMatch = closingRe.exec(text);
+      // Find matching </style>
+      const closingRe = /^<\/style\s*>/im;
+      const closeMatch = closingRe.exec(text.substring(contentStart));
       if (!closeMatch) continue;
 
-      const contentEnd = closeMatch.index;
+      const contentEnd = contentStart + closeMatch.index;
       const langId = this.detectLangId(attrs);
 
       regions.push({ langId, contentStart, contentEnd });
