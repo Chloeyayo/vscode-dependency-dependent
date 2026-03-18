@@ -11,6 +11,7 @@ import {
   Stylesheet,
 } from "vscode-css-languageservice";
 import { InsertReplaceEdit } from "vscode-languageserver-types";
+import { VueDocumentModelManager } from "../core/VueDocumentModelManager";
 
 interface CachedRegions {
   uri: string;
@@ -81,6 +82,7 @@ function mapCompletionItemKind(
 export class VueStyleCompletionProvider
   implements vscode.CompletionItemProvider
 {
+  private readonly documentModels = VueDocumentModelManager.getInstance();
   private _cssLS?: CSSLanguageService;
   private _scssLS?: CSSLanguageService;
   private _lessLS?: CSSLanguageService;
@@ -108,7 +110,7 @@ export class VueStyleCompletionProvider
       }
     }
 
-    const text = document.getText();
+    const text = this.documentModels.getDocumentModel(document).text;
     const offset = document.offsetAt(position);
 
     // Find the style region containing the cursor (cached by uri+version)

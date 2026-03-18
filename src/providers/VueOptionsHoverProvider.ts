@@ -1,15 +1,16 @@
 import * as vscode from "vscode";
-import { TreeSitterParser } from "../core/TreeSitterParser";
+import { type VueOptionsIndex } from "../core/TreeSitterParser";
+import { VueDocumentModelManager } from "../core/VueDocumentModelManager";
 
 /**
  * Hover provider for Vue 2 Options API `this.xxx` members.
  * Shows inferred types from data / computed / props / methods / watch.
  */
 export class VueOptionsHoverProvider implements vscode.HoverProvider {
-  private treeSitterParser: TreeSitterParser;
+  private documentModels: VueDocumentModelManager;
 
   constructor() {
-    this.treeSitterParser = TreeSitterParser.getInstance();
+    this.documentModels = VueDocumentModelManager.getInstance();
   }
 
   async provideHover(
@@ -18,10 +19,11 @@ export class VueOptionsHoverProvider implements vscode.HoverProvider {
     _token: vscode.CancellationToken
   ): Promise<vscode.Hover | null> {
     if (!document.fileName.endsWith(".vue")) return null;
+    const model = this.documentModels.getDocumentModel(document);
 
     // For <script lang="ts"> files, tsserver handles this.xxx hover natively
     // via ThisType wrapping in the TS plugin. Skip to avoid duplicate hovers.
-    if (/<script[^>]*\blang\s*=\s*["']?(ts|typescript)["']?/i.test(document.getText())) {
+    if (/<script[^>]*\blang\s*=\s*["']?(ts|typescript)["']?/i.test(model.text)) {
       return null;
     }
 
@@ -52,16 +54,16 @@ export class VueOptionsHoverProvider implements vscode.HoverProvider {
         offset = segEnd + 1; // skip the dot
       }
 
-      const fileContent = document.getText();
+      const index = await model.getVueOptionsIndex();
 
       if (segmentIndex === 0) {
         // Hovering on the first property: this.[xxx]
-        return this.hoverTopLevel(fileContent, fullChain[0], position, lineText, match);
+        return this.hoverTopLevel(index, fullChain[0], position, match);
       } else {
         // Hovering on a nested property: this.obj.[yyy]
         const parentChain = fullChain.slice(0, segmentIndex);
         const targetProp = fullChain[segmentIndex];
-        return this.hoverNested(fileContent, parentChain, targetProp, position, lineText, match, segmentIndex);
+        return this.hoverNested(index, parentChain, targetProp, position, match, segmentIndex);
       }
     }
 
@@ -69,14 +71,12 @@ export class VueOptionsHoverProvider implements vscode.HoverProvider {
   }
 
   private async hoverTopLevel(
-    fileContent: string,
+    index: VueOptionsIndex,
     propName: string,
     position: vscode.Position,
-    lineText: string,
     match: RegExpExecArray
   ): Promise<vscode.Hover | null> {
-    const properties = await this.treeSitterParser.collectVueOptionProperties(fileContent);
-    const prop = properties.find(p => p.name === propName);
+    const prop = index.entriesByPath.get(propName);
     if (!prop) return null;
 
     const typeStr = prop.inferredType || "any";
@@ -92,17 +92,14 @@ export class VueOptionsHoverProvider implements vscode.HoverProvider {
   }
 
   private async hoverNested(
-    fileContent: string,
+    index: VueOptionsIndex,
     parentChain: string[],
     targetProp: string,
     position: vscode.Position,
-    lineText: string,
     match: RegExpExecArray,
     segmentIndex: number
   ): Promise<vscode.Hover | null> {
-    const nestedProps = await this.treeSitterParser.collectNestedProperties(
-      fileContent, parentChain
-    );
+    const nestedProps = index.childrenByPath.get(parentChain.join(".")) || [];
     const prop = nestedProps.find(p => p.name === targetProp);
     if (!prop) return null;
 

@@ -1,5 +1,6 @@
 import * as vscode from "vscode";
 import { TreeSitterParser, type VueOptionsIndex, type VueOptionsIndexEntry } from "../core/TreeSitterParser";
+import { VueDocumentModelManager } from "../core/VueDocumentModelManager";
 import { VuePrototypeScanner, VueDollarProperty } from "../core/VuePrototypeScanner";
 
 /**
@@ -9,18 +10,12 @@ import { VuePrototypeScanner, VueDollarProperty } from "../core/VuePrototypeScan
  * - this.$xxx -> Vue built-ins, plugins, custom properties
  */
 export class VueOptionsCompletionProvider implements vscode.CompletionItemProvider {
-  private treeSitterParser: TreeSitterParser;
+  private documentModels: VueDocumentModelManager;
   private prototypeScanner: VuePrototypeScanner;
 
-  // Cache to avoid re-parsing on every keystroke
-  private cache: {
-    uri: string;
-    version: number;
-    index: VueOptionsIndex;
-  } | null = null;
-
   constructor(prototypeScanner?: VuePrototypeScanner) {
-    this.treeSitterParser = TreeSitterParser.getInstance();
+    TreeSitterParser.getInstance();
+    this.documentModels = VueDocumentModelManager.getInstance();
     this.prototypeScanner = prototypeScanner ?? new VuePrototypeScanner();
   }
 
@@ -192,15 +187,6 @@ export class VueOptionsCompletionProvider implements vscode.CompletionItemProvid
   }
 
   private async getIndex(document: vscode.TextDocument): Promise<VueOptionsIndex> {
-    const uri = document.uri.toString();
-    const version = document.version;
-
-    if (this.cache && this.cache.uri === uri && this.cache.version === version) {
-      return this.cache.index;
-    }
-
-    const index = await this.treeSitterParser.getVueOptionsIndex(document.getText());
-    this.cache = { uri, version, index };
-    return index;
+    return this.documentModels.getDocumentModel(document).getVueOptionsIndex();
   }
 }

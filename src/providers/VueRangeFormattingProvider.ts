@@ -1,4 +1,5 @@
 import * as vscode from "vscode";
+import { VueDocumentModelManager } from "../core/VueDocumentModelManager";
 
 /**
  * SFC region info: the block's content range within the Vue file.
@@ -46,6 +47,7 @@ class VueFormatContentProvider implements vscode.TextDocumentContentProvider {
  *   4. Mapping the resulting edits back to the original .vue file
  */
 export class VueRangeFormattingProvider implements vscode.DocumentRangeFormattingEditProvider, vscode.DocumentFormattingEditProvider {
+  private readonly documentModels = VueDocumentModelManager.getInstance();
   private contentProvider = new VueFormatContentProvider();
   private registration: vscode.Disposable;
   private seq = 0;
@@ -90,7 +92,7 @@ export class VueRangeFormattingProvider implements vscode.DocumentRangeFormattin
     options: vscode.FormattingOptions,
     _token: vscode.CancellationToken
   ): Promise<vscode.TextEdit[]> {
-    const text = document.getText();
+    const text = this.documentModels.getDocumentModel(document).text;
     const regions = this.parseRegions(text);
     const allEdits: vscode.TextEdit[] = [];
 
@@ -152,7 +154,7 @@ export class VueRangeFormattingProvider implements vscode.DocumentRangeFormattin
     options: vscode.FormattingOptions,
     _token: vscode.CancellationToken
   ): Promise<vscode.TextEdit[]> {
-    const text = document.getText();
+    const text = this.documentModels.getDocumentModel(document).text;
     const regions = this.parseRegions(text);
 
     const startOffset = document.offsetAt(range.start);

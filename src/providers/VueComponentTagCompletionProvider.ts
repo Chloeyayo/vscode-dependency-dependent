@@ -1,29 +1,10 @@
 import * as vscode from "vscode";
 import * as path from "path";
 import { TreeSitterParser } from "../core/TreeSitterParser";
+import { VueDocumentModelManager } from "../core/VueDocumentModelManager";
+import { VueTemplateContextService } from "../core/VueTemplateContextService";
+import { VueWorkspaceComponentIndexService } from "../core/VueWorkspaceComponentIndexService";
 import { log } from "../extension";
-import { isOffsetInsideRootTemplate } from "../core/vueTemplateUtils";
-import { NATIVE_HTML_TAGS } from "../core/htmlTags";
-
-/**
- * Convert file basename (without extension) to PascalCase component name.
- * e.g. "my-dialog.vue" → "MyDialog", "UserForm.vue" → "UserForm"
- */
-function fileNameToComponentName(filePath: string): string {
-    const base = path.basename(filePath, path.extname(filePath));
-    return base
-        .replace(/-(\w)/g, (_, c) => c.toUpperCase())
-        .replace(/^[a-z]/, (c) => c.toUpperCase());
-}
-
-/**
- * Convert PascalCase to kebab-case for filter text.
- * e.g. "MyDialog" → "my-dialog"
- */
-function toKebabCase(name: string): string {
-    return name
-        .replace(/([A-Z])/g, (_, c, i) => (i === 0 ? c.toLowerCase() : '-' + c.toLowerCase()));
-}
 
 /**
  * Compute the import path to use when importing targetFile from currentFile.
@@ -41,14 +22,6 @@ function computeImportPath(currentFile: string, targetFile: string, workspaceRoo
     return rel.startsWith('.') ? rel : './' + rel;
 }
 
-function isIgnoredVueFile(uri: vscode.Uri): boolean {
-    const normalized = uri.fsPath.replace(/\\/g, '/');
-    return normalized.includes('/node_modules/') ||
-           normalized.includes('/.git/') ||
-           normalized.includes('/dist/') ||
-           normalized.includes('/out/');
-}
-
 /** Internal data stored on each CompletionItem for use in resolveCompletionItem */
 interface ComponentItemData {
     targetPath: string;
@@ -56,145 +29,23 @@ interface ComponentItemData {
     documentUri: string;
 }
 
-interface ComponentInfo {
-    uri: vscode.Uri;
-    componentName: string;    // PascalCase
-    kebabName: string;        // kebab-case
-    nameLower: string;        // lowercase for matching
-    kebabLower: string;       // lowercase kebab for matching
-}
-
-interface WorkspaceVueIndexState {
-    files: Map<string, vscode.Uri>;
-    components: Map<string, ComponentInfo>;  // fsPath -> ComponentInfo
-    initialized: boolean;
-    initPromise?: Promise<void>;
-    watcher: vscode.FileSystemWatcher;
-}
-
-function buildComponentInfo(fsPath: string, uri: vscode.Uri): ComponentInfo | null {
-    const componentName = fileNameToComponentName(fsPath);
-    if (!componentName) return null;
-    if (NATIVE_HTML_TAGS.has(componentName.toLowerCase())) return null;
-    const kebabName = toKebabCase(componentName);
-    return {
-        uri,
-        componentName,
-        kebabName,
-        nameLower: componentName.toLowerCase(),
-        kebabLower: kebabName.toLowerCase(),
-    };
-}
-
 export class VueComponentTagCompletionProvider
     implements vscode.CompletionItemProvider, vscode.Disposable {
 
     private treeSitterParser: TreeSitterParser;
-    private workspaceStates = new Map<string, WorkspaceVueIndexState>();
-    private disposables: vscode.Disposable[] = [];
+    private documentModels: VueDocumentModelManager;
+    private templateContext: VueTemplateContextService;
+    private workspaceComponentIndex: VueWorkspaceComponentIndexService;
 
     constructor() {
         this.treeSitterParser = TreeSitterParser.getInstance();
+        this.documentModels = VueDocumentModelManager.getInstance();
+        this.templateContext = VueTemplateContextService.getInstance();
+        this.workspaceComponentIndex = new VueWorkspaceComponentIndexService();
     }
 
     public dispose(): void {
-        for (const d of this.disposables) {
-            d.dispose();
-        }
-        this.disposables = [];
-        this.workspaceStates.clear();
-    }
-
-    private getWorkspaceState(workspace: vscode.WorkspaceFolder): WorkspaceVueIndexState {
-        const key = workspace.uri.toString();
-        const cached = this.workspaceStates.get(key);
-        if (cached) {
-            return cached;
-        }
-
-        const watcher = vscode.workspace.createFileSystemWatcher(
-            new vscode.RelativePattern(workspace, '**/*.vue'),
-            false,
-            false,
-            false
-        );
-
-        const state: WorkspaceVueIndexState = {
-            files: new Map<string, vscode.Uri>(),
-            components: new Map<string, ComponentInfo>(),
-            initialized: false,
-            watcher,
-        };
-
-        watcher.onDidCreate((uri) => {
-            if (isIgnoredVueFile(uri)) return;
-            const normalized = vscode.Uri.file(uri.fsPath).fsPath;
-            state.files.set(normalized, uri);
-            const info = buildComponentInfo(normalized, uri);
-            if (info) {
-                state.components.set(normalized, info);
-            }
-        });
-        watcher.onDidDelete((uri) => {
-            const normalized = vscode.Uri.file(uri.fsPath).fsPath;
-            state.files.delete(normalized);
-            state.components.delete(normalized);
-        });
-        watcher.onDidChange((uri) => {
-            if (isIgnoredVueFile(uri)) return;
-            const normalized = vscode.Uri.file(uri.fsPath).fsPath;
-            if (state.files.has(normalized)) {
-                state.files.set(normalized, uri);
-            }
-        });
-
-        this.disposables.push(watcher);
-        this.workspaceStates.set(key, state);
-        return state;
-    }
-
-    private async ensureWorkspaceIndexed(
-        workspace: vscode.WorkspaceFolder,
-        state: WorkspaceVueIndexState
-    ): Promise<void> {
-        if (state.initialized) {
-            return;
-        }
-        if (state.initPromise) {
-            return state.initPromise;
-        }
-
-        state.initPromise = (async () => {
-            const files = await vscode.workspace.findFiles(
-                new vscode.RelativePattern(workspace, '**/*.vue'),
-                '{**/node_modules/**,**/.git/**,**/dist/**,**/out/**}'
-            );
-            for (const file of files) {
-                if (isIgnoredVueFile(file)) continue;
-                const normalized = vscode.Uri.file(file.fsPath).fsPath;
-                state.files.set(normalized, file);
-                const info = buildComponentInfo(normalized, file);
-                if (info) {
-                    state.components.set(normalized, info);
-                }
-            }
-            state.initialized = true;
-        })().finally(() => {
-            state.initPromise = undefined;
-        });
-
-        return state.initPromise;
-    }
-
-    private async getComponents(documentUri: vscode.Uri): Promise<ComponentInfo[]> {
-        const workspace = vscode.workspace.getWorkspaceFolder(documentUri);
-        if (!workspace) {
-            return [];
-        }
-
-        const state = this.getWorkspaceState(workspace);
-        await this.ensureWorkspaceIndexed(workspace, state);
-        return Array.from(state.components.values());
+        this.workspaceComponentIndex.dispose();
     }
 
     async provideCompletionItems(
@@ -204,32 +55,33 @@ export class VueComponentTagCompletionProvider
         _context: vscode.CompletionContext
     ): Promise<vscode.CompletionList | null> {
         if (!document.fileName.endsWith('.vue')) return null;
-        if (!this.isInsideTemplate(document, position)) return null;
+        const model = this.documentModels.getDocumentModel(document);
+        if (!this.templateContext.isInsideRootTemplate(model.templateBounds, document.offsetAt(position))) {
+            return null;
+        }
+
+        if (token.isCancellationRequested) return null;
 
         const lineText = document.lineAt(position.line).text;
         const textBefore = lineText.substring(0, position.character);
+        const tagCompletion = this.templateContext.getTagNameCompletionContext(
+            textBefore,
+            position.character,
+        );
+        if (!tagCompletion) return null;
 
-        // Must be right after a < (with optional partial tag name already typed)
-        const tagMatch = textBefore.match(/<([\w-]*)$/);
-        if (!tagMatch) return null;
-
-        if (token.isCancellationRequested) return null;
-
-        const partialName = tagMatch[1]; // text already typed after <
+        const partialName = tagCompletion.partialName;
         const partialLower = partialName.toLowerCase();
 
         // Range to replace: just the part already typed (after <)
-        const replaceStart = new vscode.Position(position.line, position.character - partialName.length);
+        const replaceStart = new vscode.Position(position.line, tagCompletion.replaceStartCharacter);
         const replaceRange = new vscode.Range(replaceStart, position);
 
-        const components = await this.getComponents(document.uri);
+        const components = await this.workspaceComponentIndex.getComponents(document.uri);
         if (token.isCancellationRequested) return null;
 
         const currentFilePath = document.uri.fsPath;
-        const docText = document.getText();
-
-        // Collect already-imported component names to skip
-        const importedNames = this.getAlreadyImportedNames(docText);
+        const importedNames = model.importedComponentNames;
 
         const workspace = vscode.workspace.getWorkspaceFolder(document.uri);
         const workspaceRoot = workspace?.uri.fsPath || '';
@@ -289,7 +141,7 @@ export class VueComponentTagCompletionProvider
             const document = await vscode.workspace.openTextDocument(docUri);
             if (token.isCancellationRequested) return item;
 
-            const docText = document.getText();
+            const model = this.documentModels.getDocumentModel(document);
             const currentFilePath = document.uri.fsPath;
 
             const workspace = vscode.workspace.getWorkspaceFolder(docUri);
@@ -299,7 +151,7 @@ export class VueComponentTagCompletionProvider
             const importPathStr = computeImportPath(currentFilePath, targetPath, workspaceRoot);
 
             // Extract script info (offset within full document)
-            const scriptInfo = this.treeSitterParser.extractVueScriptInfo(docText);
+            const scriptInfo = model.scriptInfo;
 
             const edits: vscode.TextEdit[] = [];
 
@@ -343,10 +195,9 @@ export class VueComponentTagCompletionProvider
                 }
             } else {
                 // No script block found — add a basic <script> with import + export default
-                // Find end of template block to insert after
-                const templateEndMatch = docText.match(/^<\/template\s*>/m);
-                if (templateEndMatch && templateEndMatch.index !== undefined) {
-                    const insertOffset = templateEndMatch.index + templateEndMatch[0].length;
+                const templateBounds = model.templateBounds;
+                if (templateBounds) {
+                    const insertOffset = templateBounds.closeTagEnd + 1;
                     const insertPos = document.positionAt(insertOffset);
                     const scriptBlock = `\n\n<script>\nimport ${componentName} from '${importPathStr}';\n\nexport default {\n  components: { ${componentName} },\n};\n</script>`;
                     edits.push(vscode.TextEdit.insert(insertPos, scriptBlock));
@@ -361,23 +212,5 @@ export class VueComponentTagCompletionProvider
         }
 
         return item;
-    }
-
-    /**
-     * Extract already-imported component names from the document's script section.
-     */
-    private getAlreadyImportedNames(docText: string): Set<string> {
-        const names = new Set<string>();
-        // Match: import ComponentName from '...'
-        const importRe = /import\s+(\w+)\s+from\s+['"][^'"]+['"]/g;
-        let m: RegExpExecArray | null;
-        while ((m = importRe.exec(docText)) !== null) {
-            names.add(m[1]);
-        }
-        return names;
-    }
-
-    private isInsideTemplate(document: vscode.TextDocument, position: vscode.Position): boolean {
-        return isOffsetInsideRootTemplate(document.getText(), document.offsetAt(position));
     }
 }

@@ -4,18 +4,10 @@ import * as fs from "fs";
 import { ResolverFactory, CachedInputFileSystem } from "enhanced-resolve";
 import { DepService } from "../DepService";
 import { TreeSitterParser } from "../core/TreeSitterParser";
+import { VueDocumentModelManager } from "../core/VueDocumentModelManager";
+import { VueTemplateContextService } from "../core/VueTemplateContextService";
 import { log } from "../extension";
-import { isOffsetInsideRootTemplate } from "../core/vueTemplateUtils";
 import { NATIVE_HTML_TAGS } from "../core/htmlTags";
-
-/** djb2 hash for caching */
-function hashContent(content: string): number {
-    let hash = 5381;
-    for (let i = 0, len = content.length; i < len; i++) {
-        hash = ((hash << 5) + hash + content.charCodeAt(i)) | 0;
-    }
-    return hash;
-}
 
 /**
  * Convert kebab-case / snake_case / camelCase tag name to PascalCase
@@ -28,74 +20,18 @@ function toPascalCase(name: string): string {
         .join('');
 }
 
-/**
- * Scan backwards from offset to find the currently open tag name.
- * Returns null if we're not inside an open tag or the tag is a native HTML element.
- */
-function getOpenTagContext(text: string, offset: number): { tagName: string } | null {
-    let inQuote: string | null = null;
-    for (let i = offset - 1; i >= 0; i--) {
-        const ch = text[i];
-        if (!inQuote) {
-            if (ch === '>') return null;            // Past a closed tag
-            if (ch === '<') {
-                if (text[i + 1] === '/') return null; // Closing tag </tag>
-                const rest = text.slice(i + 1);
-                const m = rest.match(/^([\w-]+)/);
-                return m ? { tagName: m[1] } : null;
-            }
-            if (ch === '"' || ch === "'") {
-                inQuote = ch;
-            }
-        } else {
-            if (ch === inQuote) inQuote = null;
-        }
-    }
-    return null;
-}
-
-/**
- * Extract the existing attribute names already used on the current open tag.
- * Scans forward from the < of the current tag to the cursor.
- */
-function getExistingAttributes(text: string, offset: number): Set<string> {
-    const attrs = new Set<string>();
-    // Find the opening < of the current tag
-    let inQuote: string | null = null;
-    let tagStart = -1;
-    for (let i = offset - 1; i >= 0; i--) {
-        const ch = text[i];
-        if (!inQuote) {
-            if (ch === '>') break;
-            if (ch === '<') { tagStart = i; break; }
-            if (ch === '"' || ch === "'") inQuote = ch;
-        } else {
-            if (ch === inQuote) inQuote = null;
-        }
-    }
-    if (tagStart === -1) return attrs;
-
-    // Scan the tag content from tagStart to offset
-    const tagText = text.slice(tagStart, offset);
-    // Match attribute names: word before = or standalone (including :attr and @attr)
-    const attrRe = /(?:^|\s)([:@]?[\w-]+)\s*(?:=|(?=\s|$|>|\/))/g;
-    let m: RegExpExecArray | null;
-    while ((m = attrRe.exec(tagText)) !== null) {
-        const attrName = m[1].replace(/^[:@]/, ''); // strip : or @ prefix
-        attrs.add(attrName);
-    }
-    return attrs;
-}
 
 export class VueComponentPropsCompletionProvider implements vscode.CompletionItemProvider {
     private treeSitterParser: TreeSitterParser;
+    private documentModels: VueDocumentModelManager;
+    private templateContext: VueTemplateContextService;
     private resolver: any;
     private lastWorkspace: string | undefined;
-    // Cache: abs path → { hash, props }
-    private propsCache: Map<string, { hash: number; props: string[] }> = new Map();
 
     constructor() {
         this.treeSitterParser = TreeSitterParser.getInstance();
+        this.documentModels = VueDocumentModelManager.getInstance();
+        this.templateContext = VueTemplateContextService.getInstance();
     }
 
     async provideCompletionItems(
@@ -105,13 +41,15 @@ export class VueComponentPropsCompletionProvider implements vscode.CompletionIte
         _context: vscode.CompletionContext
     ): Promise<vscode.CompletionList | null> {
         if (!document.fileName.endsWith('.vue')) return null;
-        if (!this.isInsideTemplate(document, position)) return null;
         if (token.isCancellationRequested) return null;
 
-        const text = document.getText();
+        const model = this.documentModels.getDocumentModel(document);
         const offset = document.offsetAt(position);
-
-        const tagCtx = getOpenTagContext(text, offset);
+        const tagCtx = this.templateContext.getOpenTagContext(
+            model.text,
+            offset,
+            model.templateBounds,
+        );
         if (!tagCtx) return null;
 
         const { tagName } = tagCtx;
@@ -122,7 +60,11 @@ export class VueComponentPropsCompletionProvider implements vscode.CompletionIte
         // Find import path for this component in the current file
         let importPath: string | null = null;
         try {
-            importPath = await this.treeSitterParser.findImportPathForComponentTag(text, document.uri.fsPath, tagName);
+            importPath = await this.treeSitterParser.findImportPathForComponentTag(
+                model.text,
+                document.uri.fsPath,
+                tagName,
+            );
         } catch (e) {
             log.appendLine(`VueComponentPropsCompletionProvider: findImportPathForComponentTag error: ${e}`);
         }
@@ -161,12 +103,10 @@ export class VueComponentPropsCompletionProvider implements vscode.CompletionIte
         if (!absPath || !fs.existsSync(absPath)) return null;
         if (token.isCancellationRequested) return null;
 
-        // Read + parse component file with caching
         const props = await this.getComponentProps(absPath, token);
         if (!props.length) return null;
 
-        // Filter out already-used attributes
-        const usedAttrs = getExistingAttributes(text, offset);
+        const usedAttrs = tagCtx.existingAttributes;
 
         const items: vscode.CompletionItem[] = [];
         for (const propName of props) {
@@ -183,36 +123,20 @@ export class VueComponentPropsCompletionProvider implements vscode.CompletionIte
     }
 
     private async getComponentProps(absPath: string, token: vscode.CancellationToken): Promise<string[]> {
-        let fileContent: string;
-        try {
-            fileContent = await fs.promises.readFile(absPath, 'utf-8');
-        } catch {
+        const model = await this.documentModels.getFileModel(absPath);
+        if (!model || token.isCancellationRequested) {
             return [];
         }
 
-        const hash = hashContent(fileContent);
-        const cached = this.propsCache.get(absPath);
-        if (cached && cached.hash === hash) {
-            return cached.props;
-        }
-
-        if (token.isCancellationRequested) return [];
-
         let allProps: { name: string; source: string }[] = [];
         try {
-            allProps = await this.treeSitterParser.collectVueOptionProperties(fileContent);
+            allProps = await model.getVueOptionProperties();
         } catch (e) {
             log.appendLine(`VueComponentPropsCompletionProvider: collectVueOptionProperties error: ${e}`);
             return [];
         }
 
-        const props = allProps.filter(p => p.source === 'props').map(p => p.name);
-        this.propsCache.set(absPath, { hash, props });
-        return props;
-    }
-
-    private isInsideTemplate(document: vscode.TextDocument, position: vscode.Position): boolean {
-        return isOffsetInsideRootTemplate(document.getText(), document.offsetAt(position));
+        return allProps.filter(p => p.source === 'props').map(p => p.name);
     }
 
     private async initResolver(workspace: vscode.WorkspaceFolder) {
