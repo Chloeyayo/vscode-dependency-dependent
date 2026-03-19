@@ -296,6 +296,11 @@
         "configuration": "./language-configuration.json"
       }
     ],
+    "breakpoints": [
+      {
+        "language": "vue"
+      }
+    ],
     "grammars": [
       {
         "language": "vue",

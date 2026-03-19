@@ -33,6 +33,11 @@ function init(modules: { typescript: typeof import("typescript/lib/tsserverlibra
       wrapInfo: WrapInfo | null;
     }
 
+    interface VueInstanceMemberSpec {
+      name: string;
+      isMethod: boolean;
+    }
+
     // ------------------------------------------------------------------ //
     // Helpers                                                             //
     // ------------------------------------------------------------------ //
@@ -189,26 +194,45 @@ function init(modules: { typescript: typeof import("typescript/lib/tsserverlibra
       return pattern.includes("*") ? pattern.replace("*", starMatch) : pattern;
     }
 
-    function tryResolveVueFile(candidatePath: string): string | undefined {
-      const normalized = normalizePath(candidatePath);
-      const ext = path.extname(normalized).toLowerCase();
+    const MANUAL_RESOLVE_EXTENSIONS = [
+      ".js",
+      ".jsx",
+      ".ts",
+      ".tsx",
+      ".d.ts",
+      ".json",
+      ".vue",
+    ] as const;
 
-      if (ext) {
-        if (ext !== ".vue") return undefined;
+    function getResolvedModuleExtension(resolvedFileName: string): ts.Extension {
+      const normalized = normalizePath(resolvedFileName).toLowerCase();
+      if (normalized.endsWith(".d.ts")) return ts.Extension.Dts;
+      if (normalized.endsWith(".tsx")) return ts.Extension.Tsx;
+      if (normalized.endsWith(".ts")) return ts.Extension.Ts;
+      if (normalized.endsWith(".jsx")) return ts.Extension.Jsx;
+      if (normalized.endsWith(".json")) return ts.Extension.Json;
+      return ts.Extension.Js;
+    }
+
+    function tryResolveModuleFile(candidatePath: string): string | undefined {
+      const normalized = normalizePath(candidatePath);
+      const lower = normalized.toLowerCase();
+
+      if (MANUAL_RESOLVE_EXTENSIONS.some((ext) => lower.endsWith(ext))) {
         return fileExists(normalized) ? normalized : undefined;
       }
 
-      const candidates = [
-        `${normalized}.vue`,
-        path.join(normalized, "index.vue"),
-      ];
+      const candidates = MANUAL_RESOLVE_EXTENSIONS.flatMap((ext) => [
+        `${normalized}${ext}`,
+        path.join(normalized, `index${ext}`),
+      ]);
       for (const candidate of candidates) {
         if (fileExists(candidate)) return normalizePath(candidate);
       }
       return undefined;
     }
 
-    function tryResolveVueModuleByPaths(
+    function tryResolveModuleByPaths(
       moduleName: string,
       containingFile: string,
       compilerOptions: ts.CompilerOptions,
@@ -223,7 +247,7 @@ function init(modules: { typescript: typeof import("typescript/lib/tsserverlibra
 
           for (const replacement of replacements) {
             const mapped = applyPathPattern(replacement, starMatch);
-            const resolved = tryResolveVueFile(
+            const resolved = tryResolveModuleFile(
               path.resolve(baseDirectory, mapped),
             );
             if (resolved) return resolved;
@@ -232,13 +256,13 @@ function init(modules: { typescript: typeof import("typescript/lib/tsserverlibra
       }
 
       for (const baseDirectory of baseDirectories) {
-        const resolved = tryResolveVueFile(path.resolve(baseDirectory, moduleName));
+        const resolved = tryResolveModuleFile(path.resolve(baseDirectory, moduleName));
         if (resolved) return resolved;
       }
       return undefined;
     }
 
-    function tryResolveVueModuleManually(
+    function tryResolveModuleManually(
       moduleName: string,
       containingFile: string,
       compilerOptions: ts.CompilerOptions,
@@ -246,11 +270,11 @@ function init(modules: { typescript: typeof import("typescript/lib/tsserverlibra
       let resolvedFileName: string | undefined;
 
       if (moduleName.startsWith(".") || path.isAbsolute(moduleName)) {
-        resolvedFileName = tryResolveVueFile(
+        resolvedFileName = tryResolveModuleFile(
           path.resolve(path.dirname(containingFile), moduleName),
         );
       } else {
-        resolvedFileName = tryResolveVueModuleByPaths(
+        resolvedFileName = tryResolveModuleByPaths(
           moduleName,
           containingFile,
           compilerOptions,
@@ -259,7 +283,7 @@ function init(modules: { typescript: typeof import("typescript/lib/tsserverlibra
         // 与扩展其他模块保持一致：若用户未配置 paths/baseUrl，兜底支持 @ -> src。
         if (!resolvedFileName && moduleName.startsWith("@/")) {
           for (const projectRoot of getProjectRoots(containingFile)) {
-            resolvedFileName = tryResolveVueFile(
+            resolvedFileName = tryResolveModuleFile(
               path.resolve(projectRoot, "src", moduleName.slice(2)),
             );
             if (resolvedFileName) break;
@@ -271,7 +295,7 @@ function init(modules: { typescript: typeof import("typescript/lib/tsserverlibra
 
       return {
         resolvedFileName,
-        extension: ts.Extension.Js,
+        extension: getResolvedModuleExtension(resolvedFileName),
         isExternalLibraryImport: false,
       } as ts.ResolvedModuleFull;
     }
@@ -333,6 +357,321 @@ function init(modules: { typescript: typeof import("typescript/lib/tsserverlibra
       }
     }
 
+    const VUE_INSTANCE_BUILTINS: VueInstanceMemberSpec[] = [
+      { name: "$data", isMethod: false },
+      { name: "$props", isMethod: false },
+      { name: "$options", isMethod: false },
+      { name: "$el", isMethod: false },
+      { name: "$refs", isMethod: false },
+      { name: "$parent", isMethod: false },
+      { name: "$root", isMethod: false },
+      { name: "$children", isMethod: false },
+      { name: "$slots", isMethod: false },
+      { name: "$scopedSlots", isMethod: false },
+      { name: "$attrs", isMethod: false },
+      { name: "$listeners", isMethod: false },
+      { name: "$emit", isMethod: true },
+      { name: "$on", isMethod: true },
+      { name: "$off", isMethod: true },
+      { name: "$once", isMethod: true },
+      { name: "$nextTick", isMethod: true },
+      { name: "$set", isMethod: true },
+      { name: "$delete", isMethod: true },
+      { name: "$watch", isMethod: true },
+      { name: "$forceUpdate", isMethod: true },
+      { name: "$destroy", isMethod: true },
+      { name: "$mount", isMethod: true },
+      { name: "$createElement", isMethod: true },
+    ];
+
+    const VUE_PLUGIN_INSTANCE_MEMBERS: Record<string, VueInstanceMemberSpec[]> = {
+      "vue-router": [
+        { name: "$router", isMethod: false },
+        { name: "$route", isMethod: false },
+      ],
+      vuex: [
+        { name: "$store", isMethod: false },
+      ],
+      "vue-i18n": [
+        { name: "$t", isMethod: true },
+        { name: "$tc", isMethod: true },
+        { name: "$te", isMethod: true },
+        { name: "$d", isMethod: true },
+        { name: "$n", isMethod: true },
+        { name: "$i18n", isMethod: false },
+      ],
+      axios: [
+        { name: "$http", isMethod: false },
+      ],
+      "vue-axios": [
+        { name: "$http", isMethod: false },
+      ],
+      "element-ui": [
+        { name: "$message", isMethod: true },
+        { name: "$msgbox", isMethod: true },
+        { name: "$alert", isMethod: true },
+        { name: "$confirm", isMethod: true },
+        { name: "$prompt", isMethod: true },
+        { name: "$notify", isMethod: true },
+        { name: "$loading", isMethod: true },
+      ],
+      "unicorn-icbc-ui": [
+        { name: "$message", isMethod: true },
+        { name: "$msgbox", isMethod: true },
+        { name: "$alert", isMethod: true },
+        { name: "$confirm", isMethod: true },
+        { name: "$prompt", isMethod: true },
+        { name: "$notify", isMethod: true },
+        { name: "$loading", isMethod: true },
+      ],
+      "ant-design-vue": [
+        { name: "$message", isMethod: true },
+        { name: "$notification", isMethod: true },
+        { name: "$info", isMethod: true },
+        { name: "$success", isMethod: true },
+        { name: "$error", isMethod: true },
+        { name: "$warning", isMethod: true },
+        { name: "$confirm", isMethod: true },
+      ],
+    };
+
+    const VUE_ENTRY_FILES = [
+      "main.js",
+      "main.ts",
+      "src/main.js",
+      "src/main.ts",
+      "app/main.js",
+      "app/main.ts",
+    ];
+
+    const VUE_WORKSPACE_SETTINGS = ".vscode/settings.json";
+    const VUE_PROTOTYPE_ASSIGN_RE = /Vue\.prototype\.(\$\w+)\s*=/g;
+    const WRAP_FUNC_NAME = "__v";
+    const WRAP_THIS_TYPE_NAME = "__VLS_VueThis";
+
+    function appendUniquePath(target: string[], candidate: string): void {
+      const normalized = normalizePath(candidate);
+      if (!target.includes(normalized)) {
+        target.push(normalized);
+      }
+    }
+
+    function getVueEnvironmentFiles(fileName: string): string[] {
+      const files: string[] = [];
+      for (const root of getProjectRoots(fileName)) {
+        appendUniquePath(files, path.join(root, "package.json"));
+        appendUniquePath(files, path.join(root, VUE_WORKSPACE_SETTINGS));
+        for (const relPath of VUE_ENTRY_FILES) {
+          appendUniquePath(files, path.join(root, relPath));
+        }
+      }
+      return files.filter((candidate) => fileExists(candidate));
+    }
+
+    const VUE_THIS_DECL_CACHE_MAX = 100;
+    const vueThisDeclCache = new Map<string, { fingerprint: string; decl: string }>();
+
+    function touchVueThisDeclCache(
+      cacheKey: string,
+      value: { fingerprint: string; decl: string },
+    ): void {
+      vueThisDeclCache.delete(cacheKey);
+      vueThisDeclCache.set(cacheKey, value);
+      while (vueThisDeclCache.size > VUE_THIS_DECL_CACHE_MAX) {
+        const oldest = vueThisDeclCache.keys().next().value;
+        if (oldest === undefined) break;
+        vueThisDeclCache.delete(oldest);
+      }
+    }
+
+    function getVueEnvironmentFingerprint(fileName: string): string {
+      const parts: string[] = [];
+      for (const envFile of getVueEnvironmentFiles(fileName)) {
+        try {
+          const stat = ts.sys.getModifiedTime?.(envFile);
+          if (stat) {
+            parts.push(`${envFile}:${stat.getTime()}`);
+            continue;
+          }
+
+          const fsStat = ts.sys.fileExists(envFile) ? ts.sys.readFile : undefined;
+          if (!fsStat) continue;
+          const nativeStat = require("fs").statSync(envFile) as { mtimeMs: number; size: number };
+          parts.push(`${envFile}:${nativeStat.size}:${nativeStat.mtimeMs}`);
+        } catch {
+          parts.push(`${envFile}:missing`);
+        }
+      }
+      return parts.join("|");
+    }
+
+    function addVueInstanceMember(
+      members: Map<string, string>,
+      member: VueInstanceMemberSpec,
+    ): void {
+      if (!members.has(member.name)) {
+        members.set(
+          member.name,
+          member.isMethod ? "(...args: any[]) => any" : "any",
+        );
+      }
+    }
+
+    function getPluginProvidedVueMembers(packageJsonPath: string): VueInstanceMemberSpec[] {
+      try {
+        const content = ts.sys.readFile(packageJsonPath);
+        if (!content) return [];
+        const pkg = JSON.parse(content);
+        const allDeps = {
+          ...(pkg.dependencies || {}),
+          ...(pkg.devDependencies || {}),
+        };
+
+        const members: VueInstanceMemberSpec[] = [];
+        for (const [pluginName, pluginMembers] of Object.entries(VUE_PLUGIN_INSTANCE_MEMBERS)) {
+          if (allDeps[pluginName]) {
+            members.push(...pluginMembers);
+          }
+        }
+        return members;
+      } catch {
+        return [];
+      }
+    }
+
+    function getWorkspaceConfiguredVueMembers(settingsPath: string): VueInstanceMemberSpec[] {
+      try {
+        const content = ts.sys.readFile(settingsPath);
+        if (!content) return [];
+        const parsed = ts.parseConfigFileTextToJson(settingsPath, content);
+        const raw = parsed.config?.["dependencyDependent.vue.customDollarProperties"];
+        if (!Array.isArray(raw)) {
+          return [];
+        }
+        return raw
+          .filter((value): value is string => typeof value === "string" && value.length > 0)
+          .map((value) => ({
+            name: value.startsWith("$") ? value : `$${value}`,
+            isMethod: false,
+          }));
+      } catch {
+        return [];
+      }
+    }
+
+    function getPluginConfiguredVueMembers(): VueInstanceMemberSpec[] {
+      const rawCandidates = [
+        info.config?.customDollarProperties,
+        info.config?.vue?.customDollarProperties,
+      ];
+
+      const members: VueInstanceMemberSpec[] = [];
+      for (const raw of rawCandidates) {
+        if (!Array.isArray(raw)) continue;
+        for (const value of raw) {
+          if (typeof value !== "string" || value.length === 0) continue;
+          members.push({
+            name: value.startsWith("$") ? value : `$${value}`,
+            isMethod: false,
+          });
+        }
+      }
+      return members;
+    }
+
+    function getPrototypeInjectedVueMembers(entryPath: string): VueInstanceMemberSpec[] {
+      try {
+        const content = ts.sys.readFile(entryPath);
+        if (!content) return [];
+        const members: VueInstanceMemberSpec[] = [];
+        let match: RegExpExecArray | null;
+        VUE_PROTOTYPE_ASSIGN_RE.lastIndex = 0;
+        while ((match = VUE_PROTOTYPE_ASSIGN_RE.exec(content)) !== null) {
+          members.push({
+            name: match[1],
+            isMethod: false,
+          });
+        }
+        return members;
+      } catch {
+        return [];
+      }
+    }
+
+    function buildVueThisTypeDecl(fileName: string): string {
+      const envFiles = getVueEnvironmentFiles(fileName);
+      const fingerprint = envFiles.map((candidate) => {
+        try {
+          const stat = require("fs").statSync(candidate) as { size: number; mtimeMs: number };
+          return `${candidate}:${stat.size}:${stat.mtimeMs}`;
+        } catch {
+          return `${candidate}:missing`;
+        }
+      }).join("|");
+      const cacheKey = getProjectRoots(fileName).join("|");
+      const cached = vueThisDeclCache.get(cacheKey);
+      if (cached && cached.fingerprint === fingerprint) {
+        vueThisDeclCache.delete(cacheKey);
+        vueThisDeclCache.set(cacheKey, cached);
+        return cached.decl;
+      }
+
+      const members = new Map<string, string>();
+      for (const member of VUE_INSTANCE_BUILTINS) {
+        addVueInstanceMember(members, member);
+      }
+
+      for (const envFile of envFiles) {
+        if (envFile.endsWith("package.json")) {
+          for (const member of getPluginProvidedVueMembers(envFile)) {
+            addVueInstanceMember(members, member);
+          }
+          continue;
+        }
+
+        if (envFile.endsWith(normalizePath(VUE_WORKSPACE_SETTINGS))) {
+          for (const member of getWorkspaceConfiguredVueMembers(envFile)) {
+            addVueInstanceMember(members, member);
+          }
+          continue;
+        }
+
+        for (const member of getPrototypeInjectedVueMembers(envFile)) {
+          addVueInstanceMember(members, member);
+        }
+      }
+
+      for (const member of getPluginConfiguredVueMembers()) {
+        addVueInstanceMember(members, member);
+      }
+
+      const properties = Array.from(members.entries())
+        .sort(([a], [b]) => a.localeCompare(b))
+        .map(([name, type]) => ` * @property {${type}} ${name}`);
+
+      const decl = [
+        "",
+        "/**",
+        ` * @typedef {object} ${WRAP_THIS_TYPE_NAME}`,
+        ...properties,
+        " */",
+        "/**",
+        " * @template D",
+        " * @template M",
+        " * @template C",
+        " * @param {{data?(): D, computed?: C, methods?: M, [k:string]: any}" +
+          ` & ThisType<D & M & {[K in keyof C]: C[K] extends` +
+          ` (...args: any[]) => infer R ? R : C[K]} & ${WRAP_THIS_TYPE_NAME}>} o`,
+        " * @returns {typeof o}",
+        " */",
+        `function ${WRAP_FUNC_NAME}(o) { return o; }`,
+        "",
+      ].join("\n");
+
+      touchVueThisDeclCache(cacheKey, { fingerprint, decl });
+      return decl;
+    }
+
     // ------------------------------------------------------------------ //
     // Position mapping                                                    //
     // ------------------------------------------------------------------ //
@@ -382,22 +721,6 @@ function init(modules: { typescript: typeof import("typescript/lib/tsserverlibra
     // ThisType wrapping (JS only)                                         //
     // ------------------------------------------------------------------ //
 
-    const WRAP_FUNC_NAME = "__v";
-    const WRAP_FUNC_DECL = [
-      "",
-      "/**",
-      " * @template D",
-      " * @template M",
-      " * @template C",
-      " * @param {{data?(): D, computed?: C, methods?: M, [k:string]: any}" +
-        " & ThisType<D & M & {[K in keyof C]: C[K] extends" +
-        " (...args: any[]) => infer R ? R : C[K]}>} o",
-      " * @returns {typeof o}",
-      " */",
-      `function ${WRAP_FUNC_NAME}(o) { return o; }`,
-      "",
-    ].join("\n");
-
     const WRAP_PREFIX = `${WRAP_FUNC_NAME}(`;
     const WRAP_SUFFIX = ")";
 
@@ -405,6 +728,7 @@ function init(modules: { typescript: typeof import("typescript/lib/tsserverlibra
       paddedContent: string,
       scriptStart: number,
       scriptEnd: number,
+      fileName: string,
     ): { content: string; wrapInfo: WrapInfo } | null {
       const scriptBody = paddedContent.slice(scriptStart, scriptEnd);
 
@@ -447,6 +771,7 @@ function init(modules: { typescript: typeof import("typescript/lib/tsserverlibra
       //    prefixLen + suffixLen，所以 declStart 是：
       const declStart =
         paddedContent.length + WRAP_PREFIX.length + WRAP_SUFFIX.length;
+      const wrapFuncDecl = buildVueThisTypeDecl(fileName);
 
       const content =
         paddedContent.slice(0, objOpenPos) +
@@ -454,7 +779,7 @@ function init(modules: { typescript: typeof import("typescript/lib/tsserverlibra
         paddedContent.slice(objOpenPos, objClosePos + 1) +
         WRAP_SUFFIX +
         paddedContent.slice(objClosePos + 1) + // ← 原始剩余（padAll 区域）位置不变
-        WRAP_FUNC_DECL; //                        ← 追加到最末尾
+        wrapFuncDecl; //                        ← 追加到最末尾
 
       return {
         content,
@@ -472,7 +797,7 @@ function init(modules: { typescript: typeof import("typescript/lib/tsserverlibra
     // Script extraction + caching                                         //
     // ------------------------------------------------------------------ //
 
-    function extractScript(text: string): ExtractedScript {
+    function extractScript(text: string, fileName: string): ExtractedScript {
       const scriptOpenRe = /<script(\s[^>]*)?\s*>/i;
       const scriptCloseRe = /<\/script\s*>/i;
 
@@ -524,6 +849,7 @@ function init(modules: { typescript: typeof import("typescript/lib/tsserverlibra
         originalContent,
         scriptBodyStart,
         scriptBodyEnd,
+        fileName,
       );
       if (wrapped) {
         content = wrapped.content;
@@ -577,7 +903,7 @@ function init(modules: { typescript: typeof import("typescript/lib/tsserverlibra
         };
       }
       const text = snap.getText(0, snap.getLength());
-      const result = extractScript(text);
+      const result = extractScript(text, fileName);
       setScriptCache(fileName, { version, ...result });
       return result;
     }
@@ -651,7 +977,7 @@ function init(modules: { typescript: typeof import("typescript/lib/tsserverlibra
 
       // 手动解析 .vue 目标：TS 原生 resolver 不识别 .vue 扩展，
       // 这里补上 paths/baseUrl/@ 别名与 index.vue 探测。
-      const manualResolved = tryResolveVueModuleManually(
+      const manualResolved = tryResolveModuleManually(
         moduleName,
         containingFile,
         compilerOptions,
@@ -762,7 +1088,8 @@ function init(modules: { typescript: typeof import("typescript/lib/tsserverlibra
         const head = snap.getText(0, headEnd);
         const tail = snap.getText(tailStart, len);
         // 加入宿主原始版本号，优先避免“中间改动但头尾不变”导致的误判。
-        const contentHash = baseVersion + "|" + len + ":" + head + tail;
+        const environmentHash = getVueEnvironmentFingerprint(fileName);
+        const contentHash = baseVersion + "|" + len + ":" + head + tail + "|" + environmentHash;
 
         const prev = vueContentVersions.get(fileName);
         if (prev && prev.contentHash === contentHash) {
